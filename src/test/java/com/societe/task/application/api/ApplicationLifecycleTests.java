@@ -45,12 +45,21 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
         assertThat(OffsetDateTime.parse(application.get("createdAt").asText())).isNotNull();
         assertThat(jdbcTemplate.queryForObject("SELECT name FROM applications WHERE id = ?", String.class, id))
                 .isEqualTo("My application");
+        var history = stateHistory(id);
+        assertThat(history).hasSize(1);
+        var creation = history.getFirst();
+        assertThat((Long) creation.get("id")).isPositive();
+        assertThat(creation).containsEntry("application_id", id)
+                .containsEntry("previous_state", null).containsEntry("new_state", "CREATED")
+                .containsEntry("reason", null)
+                .containsEntry("changed_at", storedApplication(id).get("created_at"));
     }
 
     @ParameterizedTest
     @EnumSource(value = ApplicationState.class, names = {"CREATED", "VERIFIED"})
     void editsOnlyBodyAndPreservesNameAndState(ApplicationState state) throws Exception {
         var id = applicationInState(state);
+        var historyBefore = stateHistory(id);
 
         mockMvc.perform(patch("/applications/{id}", id)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"body\":\"Updated body\"}"))
@@ -62,6 +71,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
 
         assertThat(jdbcTemplate.queryForObject("SELECT body FROM applications WHERE id = ?", String.class, id))
                 .isEqualTo("Updated body");
+        assertThat(stateHistory(id)).isEqualTo(historyBefore);
     }
 
     @Test
@@ -77,6 +87,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
                 .andExpect(jsonPath("$.rejectedAt").isString());
 
         var stored = storedApplication(id);
+        var history = stateHistory(id);
 
         mockMvc.perform(put("/applications/{id}/rejection", id)
                         .contentType(MediaType.APPLICATION_JSON).content(request))
@@ -87,6 +98,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
                 .andExpect(status().isConflict());
 
         assertThat(storedApplication(id)).isEqualTo(stored);
+        assertThat(stateHistory(id)).isEqualTo(history);
     }
 
     @ParameterizedTest
@@ -102,17 +114,24 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
         assertThat(stored.get("state")).isEqualTo("DELETED");
         assertThat(stored.get("name")).isEqualTo("My application");
         assertThat(stored.get("body")).isEqualTo("Initial body");
+        var history = stateHistory(UUID.fromString(id));
+        assertThat(history).hasSize(2);
+        assertThat(history.getLast()).containsEntry("previous_state", "CREATED")
+                .containsEntry("new_state", "DELETED").containsEntry("reason", reason)
+                .containsEntry("changed_at", stored.get("deleted_at"));
     }
 
     @Test
     void repeatedDeletionPreservesOriginalReasonAndTimestamp() throws Exception {
         var id = applicationInState(ApplicationState.DELETED);
         var before = storedApplication(id);
+        var historyBefore = stateHistory(id);
         for (var reason : List.of("DUPLICATE", "NO_LONGER_NEEDED")) {
             mockMvc.perform(delete("/applications/{id}", id).param("reason", reason))
                     .andExpect(status().isConflict())
                     .andExpect(jsonPath("$.detail").value(containsString("already been changed")));
             assertThat(storedApplication(id)).isEqualTo(before);
+            assertThat(stateHistory(id)).isEqualTo(historyBefore);
         }
     }
 
@@ -121,6 +140,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
     void enforcesRepresentativeTransitionsThroughApi(ApplicationState source, ApplicationState target, boolean allowed) throws Exception {
         var id = applicationInState(source);
         var before = storedApplication(id);
+        var historyBefore = stateHistory(id);
         var response = performTransition(id, target);
 
         if (allowed) {
@@ -129,6 +149,17 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
                 response.andExpect(jsonPath("$.state").value(target.name()));
             }
             var after = storedApplication(id);
+            var history = stateHistory(id);
+            assertThat(history).hasSize(historyBefore.size() + 1);
+            assertThat(history.subList(0, historyBefore.size())).isEqualTo(historyBefore);
+            var expectedReason = switch (target) {
+                case REJECTED -> "Missing documents";
+                case DELETED -> "DUPLICATE";
+                default -> null;
+            };
+            assertThat(history.getLast()).containsEntry("application_id", id)
+                    .containsEntry("previous_state", source.name()).containsEntry("new_state", target.name())
+                    .containsEntry("reason", expectedReason).containsEntry("changed_at", after.get("updated_at"));
             assertThat(after.get("state")).isEqualTo(target.name());
             assertThat(after.get("name")).isEqualTo(before.get("name"));
             assertThat(after.get("body")).isEqualTo(before.get("body"));
@@ -152,6 +183,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
                     .andExpect(jsonPath("$.title").value("Conflict"))
                     .andExpect(jsonPath("$.detail").value(containsString("current state is " + source)));
             assertThat(storedApplication(id)).isEqualTo(before);
+            assertThat(stateHistory(id)).isEqualTo(historyBefore);
         }
     }
 
@@ -194,6 +226,10 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
             assertThat(stored.get("name")).isEqualTo("My application");
             assertThat(stored.get("body")).isEqualTo("Initial body");
             assertThat(stored.get("deleted_at") != null).isEqualTo(expectedState.equals("DELETED"));
+            var history = stateHistory(id);
+            assertThat(history).hasSize(2);
+            assertThat(history.getLast()).containsEntry("previous_state", "CREATED")
+                    .containsEntry("new_state", expectedState);
         }
     }
 
@@ -212,6 +248,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
                 .andExpect(jsonPath("$.status").value(400));
         assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM applications", Integer.class)).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM application_state_history", Integer.class)).isZero();
     }
 
     @ParameterizedTest
@@ -275,6 +312,7 @@ class ApplicationLifecycleTests extends ApplicationApiTestSupport {
         for (var action : List.of("verification", "acceptance", "publication")) {
             mockMvc.perform(put("/applications/{id}/" + action, id)).andExpect(status().isNotFound());
         }
+        assertThat(stateHistory(id)).isEmpty();
     }
 
     @Test

@@ -47,6 +47,12 @@ class ApplicationPublicationTests extends ApplicationApiTestSupport {
         assertThat(number).isPositive();
         var published = storedApplication(id);
         assertThat(published).containsEntry("publication_number", number);
+        var history = stateHistory(id);
+        assertThat(history).extracting(entry -> entry.get("previous_state"))
+                .containsExactly(null, "CREATED", "VERIFIED", "ACCEPTED");
+        assertThat(history).extracting(entry -> entry.get("new_state"))
+                .containsExactly("CREATED", "VERIFIED", "ACCEPTED", "PUBLISHED");
+        assertThat(history).allSatisfy(entry -> assertThat(entry.get("reason")).isNull());
 
         mockMvc.perform(get("/applications").param("state", "PUBLISHED"))
                 .andExpect(status().isOk())
@@ -63,12 +69,14 @@ class ApplicationPublicationTests extends ApplicationApiTestSupport {
         }
         assertThat(storedApplication(id)).isEqualTo(published);
         assertThat(publicationSequenceState()).isEqualTo(sequenceBefore);
+        assertThat(stateHistory(id)).isEqualTo(history);
     }
 
     @Test
     void rollingBackPublicationKeepsStateAndNumberUnchanged() throws Exception {
         var id = applicationInState(ApplicationState.ACCEPTED);
         var before = storedApplication(id);
+        var historyBefore = stateHistory(id);
         var rolledBackPublication = new TransactionTemplate(transactionManager).execute(transaction -> {
             var published = applicationService.publish(id);
             transaction.setRollbackOnly();
@@ -78,6 +86,7 @@ class ApplicationPublicationTests extends ApplicationApiTestSupport {
         assertThat(rolledBackPublication.state()).isEqualTo(ApplicationState.PUBLISHED);
         assertThat(rolledBackPublication.publicationNumber()).isPositive();
         assertThat(storedApplication(id)).isEqualTo(before);
+        assertThat(stateHistory(id)).isEqualTo(historyBefore);
 
         var response = performTransition(id, ApplicationState.PUBLISHED).andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
@@ -85,6 +94,9 @@ class ApplicationPublicationTests extends ApplicationApiTestSupport {
         // Sequence values are not rolled back; gaps are allowed, but partial publication is not.
         assertThat(number).isGreaterThan(rolledBackPublication.publicationNumber());
         assertThat(storedApplication(id)).containsEntry("publication_number", number).containsEntry("state", "PUBLISHED");
+        assertThat(stateHistory(id)).hasSize(historyBefore.size() + 1);
+        assertThat(stateHistory(id).getLast()).containsEntry("previous_state", "ACCEPTED")
+                .containsEntry("new_state", "PUBLISHED");
     }
 
     @ParameterizedTest(name = "same application: {0}")
@@ -115,6 +127,10 @@ class ApplicationPublicationTests extends ApplicationApiTestSupport {
                     var id = UUID.fromString(application.get("id").asText());
                     assertThat(storedApplication(id)).containsEntry("state", "PUBLISHED")
                             .containsEntry("publication_number", number);
+                    var history = stateHistory(id);
+                    assertThat(history).hasSize(4);
+                    assertThat(history.getLast()).containsEntry("previous_state", "ACCEPTED")
+                            .containsEntry("new_state", "PUBLISHED");
                 }
             }
             assertThat(numbers).hasSize(sameApplication ? 1 : 2).doesNotHaveDuplicates();

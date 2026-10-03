@@ -7,6 +7,7 @@ import com.societe.task.application.domain.ApplicationState;
 import com.societe.task.application.domain.exception.ApplicationConflictException;
 import com.societe.task.application.domain.exception.ApplicationNotFoundException;
 import com.societe.task.application.persistence.JdbcApplicationRepository;
+import com.societe.task.application.persistence.JdbcApplicationStateHistoryRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
@@ -16,13 +17,17 @@ import org.springframework.transaction.annotation.Transactional;
 public class ApplicationService {
 
     private final JdbcApplicationRepository repository;
+    private final JdbcApplicationStateHistoryRepository historyRepository;
 
-    public ApplicationService(JdbcApplicationRepository repository) {
+    public ApplicationService(JdbcApplicationRepository repository, JdbcApplicationStateHistoryRepository historyRepository) {
         this.repository = repository;
+        this.historyRepository = historyRepository;
     }
 
     public Application create(String name, String body) {
-        return repository.create(UUID.randomUUID(), name, body);
+        var application = repository.create(UUID.randomUUID(), name, body);
+        historyRepository.record(application.id(), null, application.state(), null);
+        return application;
     }
 
     // Count and content use one snapshot, even while other requests create or delete rows.
@@ -55,23 +60,30 @@ public class ApplicationService {
     }
 
     public Application publish(UUID id) {
-        requireTransition(id, ApplicationState.PUBLISHED);
-        return repository.publish(id);
+        var application = requireTransition(id, ApplicationState.PUBLISHED);
+        var published = repository.publish(id);
+        historyRepository.record(id, application.state(), published.state(), null);
+        return published;
     }
 
     public Application reject(UUID id, String reason) {
         var application = requireTransition(id, ApplicationState.REJECTED);
-        return repository.reject(id, application.state(), reason);
+        var rejected = repository.reject(id, application.state(), reason);
+        historyRepository.record(id, application.state(), rejected.state(), reason);
+        return rejected;
     }
 
     public void delete(UUID id, String reason) {
-        requireTransition(id, ApplicationState.DELETED);
+        var application = requireTransition(id, ApplicationState.DELETED);
         repository.softDelete(id, reason);
+        historyRepository.record(id, application.state(), ApplicationState.DELETED, reason);
     }
 
     private Application changeState(UUID id, ApplicationState target) {
         var application = requireTransition(id, target);
-        return repository.changeState(id, application.state(), target);
+        var changed = repository.changeState(id, application.state(), target);
+        historyRepository.record(id, application.state(), changed.state(), null);
+        return changed;
     }
 
     private Application requireTransition(UUID id, ApplicationState target) {

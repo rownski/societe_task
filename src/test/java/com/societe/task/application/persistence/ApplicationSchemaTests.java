@@ -26,11 +26,10 @@ class ApplicationSchemaTests {
     private String schema;
 
     @BeforeEach
-    void migrateToV1InIsolatedSchema() {
+    void initializeIsolatedSchema() {
         jdbcTemplate = new JdbcTemplate(new DriverManagerDataSource(
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword()));
         schema = "migration_test_" + UUID.randomUUID().toString().replace("-", "");
-        flyway().migrate();
     }
 
     @AfterEach
@@ -40,10 +39,11 @@ class ApplicationSchemaTests {
 
     @Test
     void freshDatabaseIncludesStateWithCreatedDefault() {
+        flyway().migrate();
         var id = insertApplication();
 
         assertThat(stateOf(id)).isEqualTo("CREATED");
-        assertThat(flyway().info().current().getVersion().getVersion()).isEqualTo("1");
+        assertThat(flyway().info().current().getVersion().getVersion()).isEqualTo("2");
         var application = jdbcTemplate.queryForMap("SELECT * FROM " + table() + " WHERE id = ?", id);
         assertThat(application).containsEntry("name", "Test application").containsEntry("body", "Test body");
         assertThat(application.get("rejection_reason")).isNull();
@@ -55,6 +55,7 @@ class ApplicationSchemaTests {
 
     @Test
     void databaseConstraintsRequireValidStatesAndMatchingMetadata() {
+        flyway().migrate();
         var id = insertApplication();
         for (var invalidState : new String[]{"OTHER", "REJECTED", "DELETED"}) {
             assertThatThrownBy(() -> jdbcTemplate.update("UPDATE " + table() + " SET state = ? WHERE id = ?", invalidState, id))
@@ -77,6 +78,7 @@ class ApplicationSchemaTests {
 
     @Test
     void publicationNumberMustBePositiveUniqueAndPresentOnlyWhenPublished() {
+        flyway().migrate();
         var id = insertApplication();
         assertThatThrownBy(() -> jdbcTemplate.update("UPDATE " + table() + " SET state = 'PUBLISHED' WHERE id = ?", id))
                 .isInstanceOf(DataIntegrityViolationException.class);
@@ -95,6 +97,70 @@ class ApplicationSchemaTests {
                 .isInstanceOf(DataIntegrityViolationException.class);
         assertThat(stateOf(id)).isEqualTo("PUBLISHED");
         assertThat(stateOf(other)).isEqualTo("CREATED");
+    }
+
+    @Test
+    void v2PreservesExistingApplicationsWithoutInventingHistory() {
+        Flyway.configure().dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+                .schemas(schema).defaultSchema(schema).target("1").load().migrate();
+        var id = insertApplication();
+        jdbcTemplate.update("UPDATE " + table() + " SET state = 'VERIFIED' WHERE id = ?", id);
+        var before = jdbcTemplate.queryForMap("SELECT * FROM " + table() + " WHERE id = ?", id);
+
+        var result = flyway().migrate();
+
+        assertThat(result.migrationsExecuted).isEqualTo(1);
+        assertThat(flyway().info().current().getVersion().getVersion()).isEqualTo("2");
+        assertThat(jdbcTemplate.queryForMap("SELECT * FROM " + table() + " WHERE id = ?", id)).isEqualTo(before);
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM " + historyTable(), Long.class)).isZero();
+        insertHistory(id, "VERIFIED", "ACCEPTED", null);
+        assertThat(jdbcTemplate.queryForObject("SELECT previous_state FROM " + historyTable(), String.class))
+                .isEqualTo("VERIFIED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = ? AND indexname = ?", String.class,
+                schema, "idx_application_state_history_application")).contains("(application_id, id)");
+    }
+
+    @Test
+    void historyRequiresAnApplicationValidStatesAndMatchingReasons() {
+        flyway().migrate();
+        var id = insertApplication();
+        insertHistory(id, null, "CREATED", null);
+        insertHistory(id, "CREATED", "VERIFIED", null);
+        insertHistory(id, "VERIFIED", "REJECTED", "Missing documents");
+        insertHistory(id, "CREATED", "DELETED", "DUPLICATE");
+
+        var entries = jdbcTemplate.queryForList("SELECT * FROM " + historyTable() + " ORDER BY id");
+        assertThat(entries).hasSize(4).allSatisfy(entry -> {
+            assertThat((Long) entry.get("id")).isPositive();
+            assertThat(entry.get("changed_at")).isNotNull();
+        });
+        assertThat(entries).extracting(entry -> entry.get("id")).doesNotHaveDuplicates();
+        assertThatThrownBy(() -> insertHistory(UUID.randomUUID(), null, "CREATED", null))
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbcTemplate.update("DELETE FROM " + table() + " WHERE id = ?", id))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        for (var invalid : new String[][]{
+                {null, null, null}, {null, "OTHER", null}, {"OTHER", "VERIFIED", null},
+                {null, "VERIFIED", null}, {"VERIFIED", "CREATED", null}, {"VERIFIED", "VERIFIED", null},
+                {"VERIFIED", "REJECTED", null}, {"VERIFIED", "REJECTED", "  "},
+                {"CREATED", "DELETED", null}, {"CREATED", "DELETED", "OTHER"},
+                {"CREATED", "VERIFIED", "Unexpected reason"}}) {
+            assertThatThrownBy(() -> insertHistory(id, invalid[0], invalid[1], invalid[2]))
+                    .isInstanceOf(DataIntegrityViolationException.class);
+        }
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM " + historyTable(), Long.class)).isEqualTo(4);
+    }
+
+    private void insertHistory(UUID id, String previousState, String newState, String reason) {
+        jdbcTemplate.update("INSERT INTO " + historyTable()
+                + " (application_id, previous_state, new_state, reason) VALUES (?, ?, ?, ?)",
+                id, previousState, newState, reason);
+    }
+
+    private String historyTable() {
+        return schema + ".application_state_history";
     }
 
     private Flyway flyway() {

@@ -23,7 +23,7 @@ Handwritten code lives under `src/main/java/com/societe/task/application`:
 application/
 ├── domain/          Application, ApplicationState, exception/
 ├── service/         ApplicationService, ApplicationPage
-├── persistence/     JdbcApplicationRepository
+├── persistence/     JdbcApplicationRepository, JdbcApplicationStateHistoryRepository
 └── api/             ApplicationController, ApplicationMapper, ApplicationExceptionHandler
 ```
 
@@ -37,7 +37,8 @@ responses. The service owns transactions and lifecycle operations; persistence
 owns SQL and row mapping.
 
 Tests mirror the feature packages: `api` contains lifecycle, listing, and
-publication integration tests; `domain` contains state-policy tests;
+publication integration tests; `service` tests audit transaction guarantees;
+`domain` contains state-policy tests;
 `persistence` contains schema tests. Shared API test setup lives in `support`,
 with a Spring-managed PostgreSQL container reused across the API test classes.
 
@@ -86,6 +87,38 @@ Soft deletion retains the row and all its data, storing the reason and `deleted_
 Rejection stores `rejectionReason` and `rejectedAt`; these cannot be replaced after
 rejection. Mutations use transactional row locks so concurrent requests validate
 against the latest state and cannot bypass transition rules.
+
+### State-change audit history
+
+`application_state_history` stores one entry for every creation and successful
+state transition. Each entry contains an identity `id`, `application_id`,
+`previous_state`, `new_state`, `changed_at`, and optional `reason`.
+Creation records `NULL → CREATED`; rejection records the JSON reason, and soft
+deletion records the deletion enum value. Other transitions have no reason.
+
+The service inserts history in the same transaction as the application mutation:
+both commit or both roll back, including publication. Retries, invalid/forbidden
+transitions, and body edits do not add history. Existing row locks ensure concurrent
+requests cannot record the same successful transition twice.
+
+History is append-only through the application, with no update/delete operations
+or HTTP history endpoint. Soft deletion retains all entries, and a foreign key
+prevents hard-deleting an application while its history exists. This is not a
+tamper-proof audit store: direct SQL changes bypass service auditing, and privileged
+database users can modify history. There is no actor field because the POC has no
+authentication.
+
+Inspect an application's history in the SQL console:
+
+```sql
+SELECT previous_state, new_state, changed_at, reason
+FROM application_state_history
+WHERE application_id = '9c4b8206-1a2a-4e31-a7b1-58f790dabc02'
+ORDER BY id;
+```
+
+Use `id` to order entries within an application. `changed_at` is the PostgreSQL
+transaction timestamp, not commit order; entries can share a timestamp.
 
 ### Publication numbers
 
@@ -243,14 +276,19 @@ runs pending migrations from `src/main/resources/db/migration` in version order
 and records them in `flyway_schema_history`:
 
 - `V1__create_applications.sql`: creates the complete application table, including
-  the state column with a `CREATED` default, audit fields, publication number sequence,
+  the state column with a `CREATED` default, metadata fields, publication number sequence,
   and constraints enforcing valid states, matching rejection/deletion metadata, and
   positive unique numbers present exactly in the `PUBLISHED` state.
+- `V2__create_application_state_history.sql`: adds the state-change history table,
+  its constraints, and an index on `(application_id, id)`. V1 remains unchanged.
 
-This is an unreleased POC: schema changes are currently consolidated into V1 instead
-of maintaining upgrades from earlier local versions. If an older V1 or V2 has already
-run locally, recreate the development database before starting the application.
-Flyway will otherwise report checksum or missing-migration validation errors.
+For a database using the current V1, restarting the application applies V2 without
+resetting data. Existing applications are preserved and receive history only on
+subsequent transitions; historical transitions are not backfilled or invented.
+
+Earlier POC development consolidated schema changes into V1. If your local database
+still uses an older V1 checksum or an obsolete V2, Flyway will report validation
+errors. Only for disposable development data, you can recreate that database:
 
 **The following reset deletes all data in this project's Docker Compose volumes.**
 Stop the application first, then run:
@@ -261,9 +299,9 @@ docker compose up -d --wait
 ./mvnw spring-boot:run
 ```
 
-Once the schema is shared or released, do not edit applied migrations: Flyway
-validates their checksums. Add `V2__description.sql`, then V3, and so on for subsequent
-changes instead of resetting databases whose data needs to be preserved.
+Do not edit applied migrations: Flyway validates their checksums. Add V3 and later
+migrations for subsequent changes instead of resetting databases whose data needs
+to be preserved.
 
 ## Prerequisites
 
@@ -337,8 +375,11 @@ concurrent publication of the same or different applications. Listing tests use
 direct database fixtures and cover pagination, name/state filters, deleted-row
 visibility, deterministic ordering, and query validation.
 
-Migration tests cover fresh V1 creation, the default state, metadata constraints,
-and publication-number constraints. Cheap state-policy unit tests exhaustively cover
+Migration tests cover fresh V1/V2 creation, upgrading an existing V1 database without
+backfilling history, the default state, metadata/publication constraints, and audit
+constraints. Audit tests check creation and every allowed transition, reasons,
+retry/concurrency behavior, rollback, and atomicity when the history insert fails.
+Cheap state-policy unit tests exhaustively cover
 all 36 source/target combinations and body edit eligibility; API tests focus on
 HTTP/persistence behavior rather than repeating the entire policy matrix.
 Docker is required; database tests are not silently skipped when it is unavailable.

@@ -1,5 +1,6 @@
 package com.societe.task.application.support;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -37,6 +38,7 @@ public abstract class ApplicationApiTestSupport {
 
     @BeforeEach
     protected void cleanApplications() {
+        jdbcTemplate.update("DELETE FROM application_state_history");
         jdbcTemplate.update("DELETE FROM applications");
     }
 
@@ -81,5 +83,10 @@ public abstract class ApplicationApiTestSupport {
 
     protected Map<String, Object> storedApplication(UUID id) {
         return jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", id);
+    }
+
+    protected List<Map<String, Object>> stateHistory(UUID id) {
+        return jdbcTemplate.queryForList(
+                "SELECT * FROM application_state_history WHERE application_id = ? ORDER BY id", id);
     }
 }
