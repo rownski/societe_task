@@ -1,5 +1,9 @@
 # societe-task
 
+A proof-of-concept REST API for creating applications and managing their lifecycle
+through verification, acceptance, publication, rejection, or soft deletion, with
+PostgreSQL persistence and state-change audit history.
+
 Request lifecycle API starter using Java 21, Spring Boot 3.5, Maven, Spring Web,
 Spring JDBC, Actuator, PostgreSQL 17, and JUnit 5 with Testcontainers.
 
@@ -119,6 +123,34 @@ ORDER BY id;
 
 Use `id` to order entries within an application. `changed_at` is the PostgreSQL
 transaction timestamp, not commit order; entries can share a timestamp.
+
+### Operational logging
+
+Spring Boot's SLF4J/Logback logging writes to the console. No separate log database
+or file appender is configured; the runtime/deployment platform can collect output.
+
+- `INFO`: creation (UUID and state) and successful transitions (UUID, previous/new
+  states), emitted only **after the enclosing transaction commits**.
+- `DEBUG`: rejected transitions, forbidden body edits, and missing applications.
+- `ERROR`: unexpected HTTP failures, centrally logged with exception types and stack
+  frames. Exception messages and suppressed exceptions are omitted because database
+  or validation messages can contain sensitive values. Cause chains are bounded.
+  Clients receive a generic problem response; normal client errors keep their
+  `400`/`404`/`405`/`409`/`415` statuses and are not logged as unexpected failures.
+
+These application logs do not include names, bodies, rejection/deletion reasons,
+credentials, query strings, or complete request/response payloads. Successful body
+edits and repository calls are not logged individually. Database audit history
+remains authoritative: console logs are diagnostic and do not replace it.
+
+The feature package defaults to `INFO`. Enable its debug logs locally with:
+
+```sh
+APPLICATION_LOG_LEVEL=DEBUG ./mvnw spring-boot:run
+```
+
+Avoid enabling broad Spring/JDBC request or SQL debug logging when handling
+sensitive data; third-party logger output is outside these application safeguards.
 
 ### Publication numbers
 
@@ -346,6 +378,7 @@ Stop PostgreSQL with `docker compose down`. To also delete its stored data, use
 | `DB_USERNAME` | `societe` |
 | `DB_PASSWORD` | `societe` |
 | `SERVER_PORT` | `8080` |
+| `APPLICATION_LOG_LEVEL` | `INFO` (application feature logs) |
 | `POSTGRES_PORT` | `5432` (Docker Compose host port only) |
 
 For example, if port 5432 is already in use:
@@ -379,6 +412,8 @@ Migration tests cover fresh V1/V2 creation, upgrading an existing V1 database wi
 backfilling history, the default state, metadata/publication constraints, and audit
 constraints. Audit tests check creation and every allowed transition, reasons,
 retry/concurrency behavior, rollback, and atomicity when the history insert fails.
+Logging tests check after-commit timing, suppression on rollback, debug/error
+levels, sensitive-value exclusion, and preservation of normal HTTP error statuses.
 Cheap state-policy unit tests exhaustively cover
 all 36 source/target combinations and body edit eligibility; API tests focus on
 HTTP/persistence behavior rather than repeating the entire policy matrix.

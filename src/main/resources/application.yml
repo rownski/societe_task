@@ -15,6 +15,10 @@ spring:
 server:
   port: ${SERVER_PORT:8080}
 
+logging:
+  level:
+    com.societe.task.application: ${APPLICATION_LOG_LEVEL:INFO}
+
 management:
   endpoints:
     web:
