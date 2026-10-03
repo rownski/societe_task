@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: societe-task
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/societe_task}
+    username: ${DB_USERNAME:societe}
+    password: ${DB_PASSWORD:societe}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
