@@ -17,8 +17,8 @@ compiles these sources. Generated files are not committed or edited by hand.
 
 Applications use UUID identifiers. `name`, `body`, and rejection `reason` must be
 nonblank strings. Unknown JSON fields are rejected: clients cannot change the name,
-choose the initial state, or modify the state through a body edit. Create, edit, and
-successful PUT responses include the application's `state`.
+choose the initial state, or modify the state through a body edit. Create, edit,
+listing items, and successful PUT responses include the application's `state`.
 
 ## Application lifecycle
 
@@ -46,6 +46,7 @@ Body edits do not change the state, and the name is always immutable.
 
 | Operation | Endpoint | Allowed source state | Required input | Success |
 | --- | --- | --- | --- | --- |
+| List | `GET /applications` | — | Optional `name`, `state`, `page`, `size` queries | `200` with a page of applications |
 | Create | `POST /applications` | — | JSON `name`, `body` | `201` with application in `CREATED` |
 | Edit body | `PATCH /applications/{id}` | `CREATED`, `VERIFIED` | JSON `body` | `200` with application |
 | Verify | `PUT /applications/{id}/verification` | `CREATED` | No body | `200` with application in `VERIFIED` |
@@ -65,7 +66,7 @@ against the latest state and cannot bypass transition rules.
 Errors use `application/problem+json` (RFC 9457):
 
 - `400 Bad Request`: missing/invalid input, unsupported deletion reason, invalid UUID,
-  or unexpected JSON fields.
+  unsupported state, invalid pagination, or unexpected JSON fields.
 - `404 Not Found`: unknown application, or editing a deleted application.
 - `409 Conflict`: forbidden or repeated state transition, or a body edit outside
   `CREATED`/`VERIFIED` (except deleted applications, which return `404`).
@@ -75,6 +76,54 @@ explaining that the application has already been changed or is in the wrong stat
 This includes repeated rejection and deletion, even with the same reason. Conflicts
 do not change state, body, reasons, or timestamps. PUT/DELETE retries therefore have
 no additional side effects, although their response differs from the first request.
+
+## Listing and pagination
+
+```http
+GET /applications?name=loan&state=VERIFIED&page=0&size=10
+```
+
+| Query parameter | Behavior | Default |
+| --- | --- | --- |
+| `name` | Case-insensitive literal substring; blank values impose no restriction | No name filter |
+| `state` | Exact, case-sensitive `ApplicationState` enum value | All states except `DELETED` |
+| `page` | Zero-based page index, at least `0` | `0` |
+| `size` | Page size from `1` to `100` | `10` |
+
+Filters combine with **AND**. `%`, `_`, and backslashes in the name filter are
+literal characters, not search wildcards. Deleted applications are returned only
+when explicitly requesting `state=DELETED`; a name filter alone never includes them.
+Results are ordered by `created_at DESC, id DESC` (newest first, UUID tie-breaker).
+Count and page content use the same database snapshot within each listing request;
+separate requests can still reflect changes made between pages.
+
+The response contains `content` (application objects), `page`, `size`,
+`totalElements` (all matching rows, not just this page), and `totalPages`. Empty
+matches return zero totals. A page beyond the results returns empty `content`
+while preserving the matching totals. Both cases return `200`, not `404`.
+
+```json
+{
+  "content": [],
+  "page": 0,
+  "size": 10,
+  "totalElements": 0,
+  "totalPages": 0
+}
+```
+
+```sh
+# First page, default size 10; excludes DELETED.
+curl 'http://localhost:8080/applications'
+
+# Second page of verified applications whose names contain "loan".
+curl --get 'http://localhost:8080/applications' \
+  --data-urlencode 'name=loan' --data-urlencode 'state=VERIFIED' \
+  --data-urlencode 'page=1' --data-urlencode 'size=10'
+
+# Explicit access to soft-deleted applications.
+curl 'http://localhost:8080/applications?state=DELETED'
+```
 
 ## API examples
 
@@ -226,7 +275,9 @@ the container afterward. Docker Compose does not need to be running. Tests
 check the HTTP health endpoint, database connectivity, and application endpoints
 (persistence, validation, immutable name, every allowed/forbidden transition,
 state-based edit restrictions, mandatory reasons, retry conflicts, and concurrent
-verification/deletion) using real PostgreSQL. Migration tests cover fresh V1 schema
+verification/deletion, plus listing pagination, name/state filters, deleted-row
+visibility, deterministic ordering, and query validation) using real PostgreSQL.
+Migration tests cover fresh V1 schema
 creation, the default state, metadata constraints, and reruns without data changes. State-policy
 unit tests also cover all 36 source/target state combinations, including attempts
 to return to `CREATED`.

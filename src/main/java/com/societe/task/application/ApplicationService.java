@@ -4,6 +4,7 @@ import java.util.UUID;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -19,6 +20,12 @@ public class ApplicationService {
 
     public Application create(String name, String body) {
         return repository.create(UUID.randomUUID(), name, body);
+    }
+
+    // Count and content use one snapshot, even while other requests create or delete rows.
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public ApplicationPage list(String name, ApplicationState state, int page, int size) {
+        return repository.list(name, state, page, size);
     }
 
     public Application edit(UUID id, String body) {

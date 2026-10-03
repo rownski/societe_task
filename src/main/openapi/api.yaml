@@ -11,6 +11,52 @@ tags:
   - name: Applications
 paths:
   /applications:
+    get:
+      tags: [Applications]
+      operationId: listApplications
+      summary: List applications with pagination and optional filters
+      description: >-
+        Filters combine with AND. Name matching is a case-insensitive literal substring
+        search; omitted or blank names impose no name restriction. State matching is
+        exact and case-sensitive. DELETED applications are excluded unless state=DELETED
+        is explicitly requested. Results are ordered by createdAt descending, then UUID
+        descending. Empty results and pages beyond the results return 200 with empty content.
+      parameters:
+        - name: name
+          in: query
+          description: Case-insensitive literal substring of the application name
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/ApplicationState'
+        - name: page
+          in: query
+          description: Zero-based page index
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+            default: 0
+        - name: size
+          in: query
+          description: Number of applications per page
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 10
+      responses:
+        '200':
+          description: Page of matching applications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationPageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
     post:
       tags: [Applications]
       operationId: createApplication
@@ -201,6 +247,31 @@ components:
           schema:
             $ref: '#/components/schemas/ApiProblem'
   schemas:
+    ApplicationPageResponse:
+      type: object
+      required: [content, page, size, totalElements, totalPages]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApplicationResponse'
+        page:
+          type: integer
+          format: int32
+          minimum: 0
+        size:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+        totalElements:
+          type: integer
+          format: int64
+          minimum: 0
+        totalPages:
+          type: integer
+          format: int64
+          minimum: 0
     ApplicationState:
       type: string
       enum: [CREATED, VERIFIED, ACCEPTED, PUBLISHED, DELETED, REJECTED]

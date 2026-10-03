@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -33,6 +34,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
@@ -329,10 +331,201 @@ class ApplicationApiTests {
                 .andExpect(jsonPath("$.body").value("First line\nSecond line"));
     }
 
+    @Test
+    void listsWithDefaultPageSizeAndExcludesDeletedApplications() throws Exception {
+        for (var index = 0; index < 12; index++) {
+            createApplication("Application " + index);
+        }
+        var deleted = applicationInState(ApplicationState.DELETED);
+
+        var response = mockMvc.perform(get("/applications"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.page").value(0))
+                .andExpect(jsonPath("$.size").value(10))
+                .andExpect(jsonPath("$.totalElements").value(12))
+                .andExpect(jsonPath("$.totalPages").value(2))
+                .andExpect(jsonPath("$.content.length()").value(10))
+                .andReturn().getResponse().getContentAsString();
+        assertThat(objectMapper.readTree(response).get("content").toString()).doesNotContain(deleted.toString());
+
+        mockMvc.perform(get("/applications").param("page", "1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.page").value(1))
+                .andExpect(jsonPath("$.size").value(10))
+                .andExpect(jsonPath("$.content.length()").value(2))
+                .andExpect(jsonPath("$.totalElements").value(12))
+                .andExpect(jsonPath("$.totalPages").value(2));
+    }
+
+    @Test
+    void ordersByCreationTimeAndUuidDescendingAcrossPages() throws Exception {
+        var earlier = OffsetDateTime.parse("2026-01-01T00:00:00Z");
+        var lowId = UUID.fromString("00000000-0000-0000-0000-000000000001");
+        var highId = UUID.fromString("00000000-0000-0000-0000-000000000002");
+        var newestId = UUID.fromString("00000000-0000-0000-0000-000000000003");
+        insertListingFixture(lowId, earlier);
+        insertListingFixture(highId, earlier);
+        insertListingFixture(newestId, earlier.plusDays(1));
+
+        var expected = List.of(newestId, highId, lowId);
+        for (var page = 0; page < expected.size(); page++) {
+            mockMvc.perform(get("/applications").param("page", String.valueOf(page)).param("size", "1"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.content.length()").value(1))
+                    .andExpect(jsonPath("$.content[0].id").value(expected.get(page).toString()))
+                    .andExpect(jsonPath("$.totalElements").value(3))
+                    .andExpect(jsonPath("$.totalPages").value(3));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ApplicationState.class)
+    void filtersByExactStateIncludingExplicitlyRequestedDeletedApplications(ApplicationState state) throws Exception {
+        UUID expectedId = null;
+        for (var fixtureState : ApplicationState.values()) {
+            var id = applicationInState(fixtureState);
+            if (fixtureState == state) {
+                expectedId = id;
+            }
+        }
+
+        mockMvc.perform(get("/applications").param("state", state.name()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1))
+                .andExpect(jsonPath("$.content[0].id").value(expectedId.toString()))
+                .andExpect(jsonPath("$.content[0].state").value(state.name()))
+                .andExpect(jsonPath("$.totalElements").value(1))
+                .andExpect(jsonPath("$.totalPages").value(1));
+    }
+
+    @Test
+    void filtersNamesByCaseInsensitiveSubstringWithoutIncludingDeletedApplications() throws Exception {
+        createApplication("Personal LOAN request");
+        createApplication("loan renewal");
+        createApplication("Mortgage");
+        var deleted = UUID.fromString(createApplication("Loan deleted").get("id").asText());
+        performTransition(deleted, ApplicationState.DELETED).andExpect(status().isNoContent());
+
+        mockMvc.perform(get("/applications").param("name", "LoAn"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(2))
+                .andExpect(jsonPath("$.totalElements").value(2))
+                .andExpect(jsonPath("$.totalPages").value(1));
+    }
+
+    @Test
+    void combinesNameAndStateFiltersWithAnd() throws Exception {
+        var expected = UUID.fromString(createApplication("Personal LOAN request").get("id").asText());
+        performTransition(expected, ApplicationState.VERIFIED).andExpect(status().isOk());
+        createApplication("Loan created");
+        var mortgage = UUID.fromString(createApplication("Mortgage").get("id").asText());
+        performTransition(mortgage, ApplicationState.VERIFIED).andExpect(status().isOk());
+
+        mockMvc.perform(get("/applications").param("name", "loan").param("state", "VERIFIED"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1))
+                .andExpect(jsonPath("$.content[0].id").value(expected.toString()))
+                .andExpect(jsonPath("$.totalElements").value(1))
+                .andExpect(jsonPath("$.totalPages").value(1));
+    }
+
+    @Test
+    void combinesNameFilterWithExplicitDeletedState() throws Exception {
+        var expected = UUID.fromString(createApplication("Loan duplicate").get("id").asText());
+        performTransition(expected, ApplicationState.DELETED).andExpect(status().isNoContent());
+        createApplication("Loan active");
+        var mortgage = UUID.fromString(createApplication("Mortgage duplicate").get("id").asText());
+        performTransition(mortgage, ApplicationState.DELETED).andExpect(status().isNoContent());
+
+        mockMvc.perform(get("/applications").param("name", "loan").param("state", "DELETED"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1))
+                .andExpect(jsonPath("$.content[0].id").value(expected.toString()))
+                .andExpect(jsonPath("$.totalElements").value(1));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"%", "_", "\\", "' OR 1=1 --"})
+    void treatsNameFilterAsLiteralTextAndNotSqlOrWildcards(String name) throws Exception {
+        var expected = createApplication("Prefix " + name + " suffix").get("id").asText();
+        createApplication("Other application");
+
+        mockMvc.perform(get("/applications").param("name", name))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1))
+                .andExpect(jsonPath("$.content[0].id").value(expected))
+                .andExpect(jsonPath("$.totalElements").value(1));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "  ", "\t"})
+    void blankNameFilterImposesNoRestriction(String name) throws Exception {
+        createApplication();
+        applicationInState(ApplicationState.DELETED);
+        mockMvc.perform(get("/applications").param("name", name))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1))
+                .andExpect(jsonPath("$.totalElements").value(1));
+    }
+
+    @Test
+    void returnsEmptyPageWhenDatabaseIsEmpty() throws Exception {
+        mockMvc.perform(get("/applications"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content").isEmpty())
+                .andExpect(jsonPath("$.page").value(0))
+                .andExpect(jsonPath("$.size").value(10))
+                .andExpect(jsonPath("$.totalElements").value(0))
+                .andExpect(jsonPath("$.totalPages").value(0));
+    }
+
+    @Test
+    void returnsEmptyPageWhenFiltersHaveNoMatches() throws Exception {
+        createApplication();
+        mockMvc.perform(get("/applications").param("name", "Unmatched"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content").isEmpty())
+                .andExpect(jsonPath("$.totalElements").value(0))
+                .andExpect(jsonPath("$.totalPages").value(0));
+    }
+
+    @Test
+    void returnsEmptyOutOfRangePageWithoutOverflowingOffset() throws Exception {
+        createApplication();
+        mockMvc.perform(get("/applications").param("page", "2147483647").param("size", "100"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content").isEmpty())
+                .andExpect(jsonPath("$.page").value(2147483647))
+                .andExpect(jsonPath("$.size").value(100))
+                .andExpect(jsonPath("$.totalElements").value(1))
+                .andExpect(jsonPath("$.totalPages").value(1));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"page,-1", "page,abc", "page,2147483648", "size,0", "size,-1", "size,101", "size,abc",
+            "state,OTHER", "state,verified"})
+    void rejectsInvalidListingParameters(String parameter, String value) throws Exception {
+        mockMvc.perform(get("/applications").param(parameter, value))
+                .andExpect(status().isBadRequest())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.status").value(400));
+    }
+
+    private void insertListingFixture(UUID id, OffsetDateTime createdAt) {
+        jdbcTemplate.update("""
+                INSERT INTO applications (id, name, body, created_at, updated_at)
+                VALUES (?, 'Listing fixture', 'Initial body', ?, ?)
+                """, id, createdAt, createdAt);
+    }
+
     private JsonNode createApplication() throws Exception {
+        return createApplication("My application");
+    }
+
+    private JsonNode createApplication(String name) throws Exception {
         var response = mockMvc.perform(post("/applications")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"My application\",\"body\":\"Initial body\"}"))
+                        .content(objectMapper.writeValueAsString(Map.of("name", name, "body", "Initial body"))))
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString();
         return objectMapper.readTree(response);

@@ -3,6 +3,7 @@ package com.societe.task.application;
 import java.util.UUID;
 
 import com.societe.task.api.ApplicationsApi;
+import com.societe.task.api.model.ApplicationPageResponse;
 import com.societe.task.api.model.ApplicationResponse;
 import com.societe.task.api.model.CreateApplicationRequest;
 import com.societe.task.api.model.DeletionReason;
@@ -19,6 +20,18 @@ public class ApplicationController implements ApplicationsApi {
 
     public ApplicationController(ApplicationService service) {
         this.service = service;
+    }
+
+    @Override
+    public ResponseEntity<ApplicationPageResponse> listApplications(
+            String name, com.societe.task.api.model.ApplicationState state, Integer page, Integer size) {
+        var result = service.list(name, state == null ? null : ApplicationState.valueOf(state.getValue()), page, size);
+        return ResponseEntity.ok(new ApplicationPageResponse()
+                .content(result.content().stream().map(this::toResponse).toList())
+                .page(result.page())
+                .size(result.size())
+                .totalElements(result.totalElements())
+                .totalPages(result.totalPages()));
     }
 
     @Override

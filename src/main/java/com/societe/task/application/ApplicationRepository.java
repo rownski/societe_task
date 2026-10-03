@@ -1,6 +1,8 @@
 package com.societe.task.application;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -35,6 +37,36 @@ public class ApplicationRepository {
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 RETURNING *
                 """, ROW_MAPPER, id, name, body);
+    }
+
+    public ApplicationPage list(String name, ApplicationState state, int page, int size) {
+        var filter = filter(name, state);
+        var totalElements = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM applications " + filter.clause(), Long.class, filter.parameters().toArray());
+        var parameters = new ArrayList<>(filter.parameters());
+        parameters.add(size);
+        parameters.add((long) page * size);
+        var content = jdbcTemplate.query("SELECT * FROM applications " + filter.clause()
+                + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", ROW_MAPPER, parameters.toArray());
+        var totalPages = totalElements / size + (totalElements % size == 0 ? 0 : 1);
+        return new ApplicationPage(content, page, size, totalElements, totalPages);
+    }
+
+    private Filter filter(String name, ApplicationState state) {
+        var parameters = new ArrayList<Object>();
+        var clause = state == null ? "WHERE state <> 'DELETED'" : "WHERE state = ?";
+        if (state != null) {
+            parameters.add(state.name());
+        }
+        if (name != null && !name.isBlank()) {
+            clause += " AND name ILIKE ? ESCAPE '\\'";
+            var escapedName = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+            parameters.add("%" + escapedName + "%");
+        }
+        return new Filter(clause, parameters);
+    }
+
+    private record Filter(String clause, List<Object> parameters) {
     }
 
     // Call within a transaction: the lock serializes all edits and state transitions.
