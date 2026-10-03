@@ -1,4 +1,4 @@
-package com.societe.task.application;
+package com.societe.task.application.persistence;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -6,12 +6,14 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import com.societe.task.application.domain.Application;
+import com.societe.task.application.domain.ApplicationState;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 @Repository
-public class ApplicationRepository {
+public class JdbcApplicationRepository {
 
     private static final RowMapper<Application> ROW_MAPPER = (result, rowNumber) -> new Application(
             result.getObject("id", UUID.class),
@@ -28,7 +30,7 @@ public class ApplicationRepository {
 
     private final JdbcTemplate jdbcTemplate;
 
-    public ApplicationRepository(JdbcTemplate jdbcTemplate) {
+    public JdbcApplicationRepository(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = jdbcTemplate;
     }
 
@@ -40,17 +42,19 @@ public class ApplicationRepository {
                 """, ROW_MAPPER, id, name, body);
     }
 
-    public ApplicationPage list(String name, ApplicationState state, int page, int size) {
+    public long count(String name, ApplicationState state) {
         var filter = filter(name, state);
-        var totalElements = jdbcTemplate.queryForObject(
+        return jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM applications " + filter.clause(), Long.class, filter.parameters().toArray());
+    }
+
+    public List<Application> list(String name, ApplicationState state, int page, int size) {
+        var filter = filter(name, state);
         var parameters = new ArrayList<>(filter.parameters());
         parameters.add(size);
         parameters.add((long) page * size);
-        var content = jdbcTemplate.query("SELECT * FROM applications " + filter.clause()
+        return jdbcTemplate.query("SELECT * FROM applications " + filter.clause()
                 + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", ROW_MAPPER, parameters.toArray());
-        var totalPages = totalElements / size + (totalElements % size == 0 ? 0 : 1);
-        return new ApplicationPage(content, page, size, totalElements, totalPages);
     }
 
     private Filter filter(String name, ApplicationState state) {

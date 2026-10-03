@@ -91,8 +91,8 @@
                             <inputSpec>${project.basedir}/src/main/openapi/api.yaml</inputSpec>
                             <generatorName>spring</generatorName>
                             <output>${project.build.directory}/generated-sources/openapi</output>
-                            <apiPackage>com.societe.task.api</apiPackage>
-                            <modelPackage>com.societe.task.api.model</modelPackage>
+                            <apiPackage>com.societe.task.application.api</apiPackage>
+                            <modelPackage>com.societe.task.application.api.dto</modelPackage>
                             <generateApiTests>false</generateApiTests>
                             <generateModelTests>false</generateModelTests>
                             <generateApiDocumentation>false</generateApiDocumentation>

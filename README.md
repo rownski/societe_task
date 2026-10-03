@@ -15,6 +15,32 @@ compiles these sources. Generated files are not committed or edited by hand.
 ./mvnw generate-sources
 ```
 
+### Package structure
+
+Handwritten code lives under `src/main/java/com/societe/task/application`:
+
+```text
+application/
+├── domain/          Application, ApplicationState, exception/
+├── service/         ApplicationService, ApplicationPage
+├── persistence/     JdbcApplicationRepository
+└── api/             ApplicationController, ApplicationMapper, ApplicationExceptionHandler
+```
+
+OpenAPI Generator creates `ApplicationsApi` in
+`com.societe.task.application.api` and request/response DTOs in
+`com.societe.task.application.api.dto`, under `target/generated-sources/openapi`.
+Change the contract or generator configuration in `pom.xml`, not generated files.
+Domain models remain separate from HTTP DTOs. The API mapper converts between
+them, and the exception handler translates business exceptions into HTTP problem
+responses. The service owns transactions and lifecycle operations; persistence
+owns SQL and row mapping.
+
+Tests mirror the feature packages: `api` contains lifecycle, listing, and
+publication integration tests; `domain` contains state-policy tests;
+`persistence` contains schema tests. Shared API test setup lives in `support`,
+with a Spring-managed PostgreSQL container reused across the API test classes.
+
 Applications use UUID identifiers. `name`, `body`, and rejection `reason` must be
 nonblank strings. Unknown JSON fields are rejected: clients cannot change the name,
 choose the initial state, set a publication number, or modify the state through a body

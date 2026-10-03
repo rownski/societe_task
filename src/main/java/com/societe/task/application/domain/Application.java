@@ -1,4 +1,4 @@
-package com.societe.task.application;
+package com.societe.task.application.domain;
 
 import java.time.OffsetDateTime;
 import java.util.UUID;

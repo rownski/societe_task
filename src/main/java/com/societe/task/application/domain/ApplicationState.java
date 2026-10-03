@@ -1,4 +1,4 @@
-package com.societe.task.application;
+package com.societe.task.application.domain;
 
 public enum ApplicationState {
     CREATED,

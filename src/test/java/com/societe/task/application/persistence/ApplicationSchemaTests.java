@@ -1,4 +1,4 @@
-package com.societe.task.application;
+package com.societe.task.application.persistence;
 
 import java.util.UUID;
 
@@ -17,7 +17,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @Testcontainers
-class ApplicationStateMigrationTests {
+class ApplicationSchemaTests {
 
     @Container
     static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
