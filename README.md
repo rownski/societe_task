@@ -1,8 +1,12 @@
 # societe-task
 
-A proof-of-concept REST API for creating applications and managing their lifecycle
-through verification, acceptance, publication, rejection, or soft deletion, with
-PostgreSQL persistence and state-change audit history.
+This POC demonstrates an application lifecycle API, prioritizing correct state
+transitions, safe concurrent updates, and traceable changes over architectural
+complexity. OpenAPI makes the contract explicit, separate domain/API/persistence
+packages keep responsibilities clear, and transactions keep state changes and
+audit history consistent. PostgreSQL-backed Testcontainers tests verify real
+behavior. The scope is deliberately focused; production concerns such as
+authentication are not implemented.
 
 Request lifecycle API starter using Java 21, Spring Boot 3.5, Maven, Spring Web,
 Spring JDBC, Actuator, PostgreSQL 17, and JUnit 5 with Testcontainers.
