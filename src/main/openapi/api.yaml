@@ -1,0 +1,200 @@
+openapi: 3.0.3
+info:
+  title: Application lifecycle API
+  version: 1.0.0
+  description: Create applications, edit their body, reject them, and soft-delete them.
+tags:
+  - name: Applications
+paths:
+  /applications:
+    post:
+      tags: [Applications]
+      operationId: createApplication
+      summary: Create an application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApplicationRequest'
+      responses:
+        '201':
+          description: Application created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /applications/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    patch:
+      tags: [Applications]
+      operationId: editApplication
+      summary: Replace the application body without changing its name
+      description: Rejected applications can still be edited; deleted applications cannot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditApplicationRequest'
+      responses:
+        '200':
+          description: Application updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Applications]
+      operationId: deleteApplication
+      summary: Soft-delete an application with a mandatory reason
+      description: >-
+        Retains the application, deletion timestamp, and reason. Repeating deletion
+        returns 204 without changing the original deletion reason or timestamp.
+      parameters:
+        - name: reason
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/DeletionReason'
+      responses:
+        '204':
+          description: Application soft-deleted (or already deleted)
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /applications/{id}/rejection:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    put:
+      tags: [Applications]
+      operationId: rejectApplication
+      summary: Set or replace the rejection reason
+      description: >-
+        A nonblank reason is mandatory. Repeating the same rejection leaves its
+        timestamp unchanged. Deleted applications cannot be rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejectApplicationRequest'
+      responses:
+        '200':
+          description: Application rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  parameters:
+    ApplicationId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Missing or invalid input, including unexpected JSON properties
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ApiProblem'
+    NotFound:
+      description: Application does not exist, or is deleted (except repeated deletion)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ApiProblem'
+  schemas:
+    CreateApplicationRequest:
+      type: object
+      additionalProperties: false
+      required: [name, body]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          pattern: '[\s\S]*\S[\s\S]*'
+          example: Loan application
+        body:
+          type: string
+          minLength: 1
+          pattern: '[\s\S]*\S[\s\S]*'
+          example: Please review my application.
+    EditApplicationRequest:
+      type: object
+      additionalProperties: false
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          pattern: '[\s\S]*\S[\s\S]*'
+    RejectApplicationRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          pattern: '[\s\S]*\S[\s\S]*'
+          example: Required documents are missing.
+    DeletionReason:
+      type: string
+      enum: [DUPLICATE, CREATED_BY_MISTAKE, NO_LONGER_NEEDED]
+    ApplicationResponse:
+      type: object
+      required: [id, name, body, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        body:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        rejectionReason:
+          type: string
+          nullable: true
+        rejectedAt:
+          type: string
+          format: date-time
+          nullable: true
+    ApiProblem:
+      type: object
+      description: RFC 9457 problem details
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri
