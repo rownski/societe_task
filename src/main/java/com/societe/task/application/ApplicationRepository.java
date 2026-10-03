@@ -15,6 +15,7 @@ public class ApplicationRepository {
             result.getObject("id", UUID.class),
             result.getString("name"),
             result.getString("body"),
+            ApplicationState.valueOf(result.getString("state")),
             result.getObject("created_at", OffsetDateTime.class),
             result.getObject("updated_at", OffsetDateTime.class),
             result.getString("rejection_reason"),
@@ -36,7 +37,7 @@ public class ApplicationRepository {
                 """, ROW_MAPPER, id, name, body);
     }
 
-    // Call within a transaction: the lock serializes edit, rejection, and deletion.
+    // Call within a transaction: the lock serializes all edits and state transitions.
     public Optional<Application> findByIdForUpdate(UUID id) {
         return jdbcTemplate.query("SELECT * FROM applications WHERE id = ? FOR UPDATE", ROW_MAPPER, id)
                 .stream().findFirst();
@@ -45,25 +46,35 @@ public class ApplicationRepository {
     public Application updateBody(UUID id, String body) {
         return jdbcTemplate.queryForObject("""
                 UPDATE applications SET body = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND deleted_at IS NULL
+                WHERE id = ? AND state IN ('CREATED', 'VERIFIED')
                 RETURNING *
                 """, ROW_MAPPER, body, id);
     }
 
-    public Application reject(UUID id, String reason) {
+    public Application changeState(UUID id, ApplicationState current, ApplicationState target) {
+        return jdbcTemplate.queryForObject("""
+                UPDATE applications SET state = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state = ?
+                RETURNING *
+                """, ROW_MAPPER, target.name(), id, current.name());
+    }
+
+    public Application reject(UUID id, ApplicationState current, String reason) {
         return jdbcTemplate.queryForObject("""
                 UPDATE applications
-                SET rejection_reason = ?, rejected_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND deleted_at IS NULL
+                SET state = 'REJECTED', rejection_reason = ?,
+                    rejected_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state = ?
                 RETURNING *
-                """, ROW_MAPPER, reason, id);
+                """, ROW_MAPPER, reason, id, current.name());
     }
 
     public void softDelete(UUID id, String reason) {
         jdbcTemplate.update("""
                 UPDATE applications
-                SET deletion_reason = ?, deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND deleted_at IS NULL
+                SET state = 'DELETED', deletion_reason = ?,
+                    deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state = 'CREATED'
                 """, reason, id);
     }
 }

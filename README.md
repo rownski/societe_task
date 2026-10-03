@@ -15,46 +15,150 @@ compiles these sources. Generated files are not committed or edited by hand.
 ./mvnw generate-sources
 ```
 
-Flyway creates the database schema automatically at application startup. Applications
-use UUID identifiers. `name`, `body`, and rejection `reason` must be nonblank strings.
-Unknown JSON fields are rejected, so editing cannot change the name.
+Applications use UUID identifiers. `name`, `body`, and rejection `reason` must be
+nonblank strings. Unknown JSON fields are rejected: clients cannot change the name,
+choose the initial state, or modify the state through a body edit. Create, edit, and
+successful PUT responses include the application's `state`.
 
-| Operation | Endpoint | Required input | Success |
-| --- | --- | --- | --- |
-| Create | `POST /applications` | JSON `name`, `body` | `201` with application |
-| Edit body | `PATCH /applications/{id}` | JSON `body` | `200` with application |
-| Reject | `PUT /applications/{id}/rejection` | JSON `reason` | `200` with application |
-| Soft-delete | `DELETE /applications/{id}?reason=...` | Enum query parameter | `204` |
+## Application lifecycle
+
+```text
+CREATED ──→ VERIFIED ──→ ACCEPTED ──→ PUBLISHED
+   │            │            │
+   ▼            ▼            ▼
+DELETED      REJECTED      REJECTED
+```
+
+| Current state | Allowed next states | Body editable? |
+| --- | --- | --- |
+| `CREATED` | `VERIFIED`, `DELETED` | Yes |
+| `VERIFIED` | `ACCEPTED`, `REJECTED` | Yes |
+| `ACCEPTED` | `PUBLISHED`, `REJECTED` | No |
+| `PUBLISHED` | None | No |
+| `DELETED` | None | No |
+| `REJECTED` | None | No |
+
+Creation always assigns `CREATED`. Only the transitions above are allowed; steps
+cannot be skipped or reversed. `PUBLISHED`, `DELETED`, and `REJECTED` are terminal.
+Body edits do not change the state, and the name is always immutable.
+
+### Endpoints
+
+| Operation | Endpoint | Allowed source state | Required input | Success |
+| --- | --- | --- | --- | --- |
+| Create | `POST /applications` | — | JSON `name`, `body` | `201` with application in `CREATED` |
+| Edit body | `PATCH /applications/{id}` | `CREATED`, `VERIFIED` | JSON `body` | `200` with application |
+| Verify | `PUT /applications/{id}/verification` | `CREATED` | No body | `200` with application in `VERIFIED` |
+| Accept | `PUT /applications/{id}/acceptance` | `VERIFIED` | No body | `200` with application in `ACCEPTED` |
+| Publish | `PUT /applications/{id}/publication` | `ACCEPTED` | No body | `200` with application in `PUBLISHED` |
+| Reject | `PUT /applications/{id}/rejection` | `VERIFIED`, `ACCEPTED` | JSON `reason` | `200` with application in `REJECTED` |
+| Soft-delete | `DELETE /applications/{id}?reason=...` | `CREATED` | Enum query parameter | `204` |
 
 Deletion reasons: `DUPLICATE`, `CREATED_BY_MISTAKE`, `NO_LONGER_NEEDED` (case-sensitive).
-Soft deletion preserves all data, the reason, and `deleted_at`. Repeated deletion
-returns `204` without changing the original reason or timestamp. Editing or rejecting
-a deleted application returns `404`. Unknown UUIDs return `404`; invalid UUIDs and
-invalid input return `400`, using `application/problem+json` error responses.
+Soft deletion retains the row and all its data, storing the reason and `deleted_at`.
+Rejection stores `rejectionReason` and `rejectedAt`; these cannot be replaced after
+rejection. Mutations use transactional row locks so concurrent requests validate
+against the latest state and cannot bypass transition rules.
 
-Rejection stores `rejectionReason` and `rejectedAt`; repeating the same `PUT` does not
-change timestamps. A later `PUT` can replace the rejection reason. Rejected applications
-can still be edited or deleted. Mutations use transactional row locks to prevent edits
-or rejection racing with deletion.
+### Errors and retries
 
-With the application running:
+Errors use `application/problem+json` (RFC 9457):
+
+- `400 Bad Request`: missing/invalid input, unsupported deletion reason, invalid UUID,
+  or unexpected JSON fields.
+- `404 Not Found`: unknown application, or editing a deleted application.
+- `409 Conflict`: forbidden or repeated state transition, or a body edit outside
+  `CREATED`/`VERIFIED` (except deleted applications, which return `404`).
+
+Repeating a successful transition is **not** treated as success: it returns `409`
+explaining that the application has already been changed or is in the wrong state.
+This includes repeated rejection and deletion, even with the same reason. Conflicts
+do not change state, body, reasons, or timestamps. PUT/DELETE retries therefore have
+no additional side effects, although their response differs from the first request.
+
+## API examples
+
+With the application running, use these shell helpers. These examples require
+`jq` to extract the UUID; each workflow creates a separate application.
 
 ```sh
-curl -X POST http://localhost:8080/applications \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"My application","body":"Initial body"}'
-
-# Set ID to the UUID returned by the create response.
-ID='replace-with-application-uuid'
-
-curl -X PATCH "http://localhost:8080/applications/$ID" \
-  -H 'Content-Type: application/json' -d '{"body":"Updated body"}'
-
-curl -X PUT "http://localhost:8080/applications/$ID/rejection" \
-  -H 'Content-Type: application/json' -d '{"reason":"Missing documents"}'
-
-curl -X DELETE "http://localhost:8080/applications/$ID?reason=DUPLICATE"
+BASE_URL=http://localhost:8080
+create_application() {
+  curl --fail-with-body -sS -X POST "$BASE_URL/applications" \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"My application","body":"Initial body"}' | jq -er '.id'
+}
 ```
+
+### Create → verify → accept → publish
+
+```sh
+ID=$(create_application)
+curl --fail-with-body -sS -X PATCH "$BASE_URL/applications/$ID" \
+  -H 'Content-Type: application/json' -d '{"body":"Edited while CREATED"}'
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/verification"
+curl --fail-with-body -sS -X PATCH "$BASE_URL/applications/$ID" \
+  -H 'Content-Type: application/json' -d '{"body":"Edited while VERIFIED"}'
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/acceptance"
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/publication"
+
+# Repeating publication returns 409 Conflict, without changing data.
+curl -i -X PUT "$BASE_URL/applications/$ID/publication"
+```
+
+### Create → delete
+
+```sh
+ID=$(create_application)
+curl --fail-with-body -sS -X DELETE "$BASE_URL/applications/$ID?reason=DUPLICATE"
+```
+
+### Create → verify → reject
+
+```sh
+ID=$(create_application)
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/verification"
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/rejection" \
+  -H 'Content-Type: application/json' -d '{"reason":"Missing documents"}'
+```
+
+### Create → verify → accept → reject
+
+```sh
+ID=$(create_application)
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/verification"
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/acceptance"
+curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/rejection" \
+  -H 'Content-Type: application/json' -d '{"reason":"Not eligible for publication"}'
+```
+
+## Database migrations
+
+Spring Boot auto-configures Flyway using `spring.datasource`. At startup, Flyway
+runs pending migrations from `src/main/resources/db/migration` in version order
+and records them in `flyway_schema_history`:
+
+- `V1__create_applications.sql`: creates the complete application table, including
+  the state column with a `CREATED` default, audit fields, and constraints enforcing
+  valid state values and matching rejection/deletion metadata.
+
+This is an unreleased POC: schema changes are currently consolidated into V1 instead
+of maintaining upgrades from earlier local versions. If an older V1 or V2 has already
+run locally, recreate the development database before starting the application.
+Flyway will otherwise report checksum or missing-migration validation errors.
+
+**The following reset deletes all data in this project's Docker Compose volumes.**
+Stop the application first, then run:
+
+```sh
+docker compose down -v
+docker compose up -d --wait
+./mvnw spring-boot:run
+```
+
+Once the schema is shared or released, do not edit applied migrations: Flyway
+validates their checksums. Add `V2__description.sql`, then V3, and so on for subsequent
+changes instead of resetting databases whose data needs to be preserved.
 
 ## Prerequisites
 
@@ -120,8 +224,12 @@ Tests automatically start an isolated PostgreSQL container on a random port,
 configure the datasource using Spring Boot's `@ServiceConnection`, and remove
 the container afterward. Docker Compose does not need to be running. Tests
 check the HTTP health endpoint, database connectivity, and application endpoints
-(persistence, validation, immutable name, rejection, soft deletion, and idempotency)
-using real PostgreSQL.
+(persistence, validation, immutable name, every allowed/forbidden transition,
+state-based edit restrictions, mandatory reasons, retry conflicts, and concurrent
+verification/deletion) using real PostgreSQL. Migration tests cover fresh V1 schema
+creation, the default state, metadata constraints, and reruns without data changes. State-policy
+unit tests also cover all 36 source/target state combinations, including attempts
+to return to `CREATED`.
 Docker is required; database tests are not silently skipped when it is unavailable.
 
 ## Build

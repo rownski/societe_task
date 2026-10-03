@@ -7,6 +7,7 @@ public record Application(
         UUID id,
         String name,
         String body,
+        ApplicationState state,
         OffsetDateTime createdAt,
         OffsetDateTime updatedAt,
         String rejectionReason,

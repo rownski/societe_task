@@ -1,8 +1,12 @@
 openapi: 3.0.3
 info:
   title: Application lifecycle API
-  version: 1.0.0
-  description: Create applications, edit their body, reject them, and soft-delete them.
+  version: 0.0.1
+  description: >-
+    Strict application lifecycle: CREATED to VERIFIED to ACCEPTED to PUBLISHED;
+    CREATED to DELETED; VERIFIED or ACCEPTED to REJECTED. All other transitions,
+    including repeated actions, return 409. Body edits are allowed only in CREATED
+    or VERIFIED. PUBLISHED, DELETED, and REJECTED are terminal states.
 tags:
   - name: Applications
 paths:
@@ -11,6 +15,7 @@ paths:
       tags: [Applications]
       operationId: createApplication
       summary: Create an application
+      description: Assigns a UUID and the initial CREATED state. Clients cannot supply a state.
       requestBody:
         required: true
         content:
@@ -33,7 +38,10 @@ paths:
       tags: [Applications]
       operationId: editApplication
       summary: Replace the application body without changing its name
-      description: Rejected applications can still be edited; deleted applications cannot.
+      description: >-
+        Allowed only in CREATED or VERIFIED, without changing the state or name.
+        Editing an ACCEPTED, PUBLISHED, or REJECTED application returns 409;
+        editing a DELETED application returns 404.
       requestBody:
         required: true
         content:
@@ -51,13 +59,15 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
     delete:
       tags: [Applications]
       operationId: deleteApplication
       summary: Soft-delete an application with a mandatory reason
       description: >-
-        Retains the application, deletion timestamp, and reason. Repeating deletion
-        returns 204 without changing the original deletion reason or timestamp.
+        Allowed only in CREATED. Sets the state to DELETED and retains the application,
+        deletion timestamp, and reason. Repeated deletion returns 409 without changing data.
       parameters:
         - name: reason
           in: query
@@ -66,21 +76,75 @@ paths:
             $ref: '#/components/schemas/DeletionReason'
       responses:
         '204':
-          description: Application soft-deleted (or already deleted)
+          description: Application soft-deleted
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /applications/{id}/verification:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    put:
+      tags: [Applications]
+      operationId: verifyApplication
+      summary: Verify a created application
+      description: Only CREATED to VERIFIED is allowed. Repeated verification returns 409.
+      responses:
+        '200':
+          $ref: '#/components/responses/ApplicationChanged'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /applications/{id}/acceptance:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    put:
+      tags: [Applications]
+      operationId: acceptApplication
+      summary: Accept a verified application
+      description: Only VERIFIED to ACCEPTED is allowed. Repeated acceptance returns 409.
+      responses:
+        '200':
+          $ref: '#/components/responses/ApplicationChanged'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /applications/{id}/publication:
+    parameters:
+      - $ref: '#/components/parameters/ApplicationId'
+    put:
+      tags: [Applications]
+      operationId: publishApplication
+      summary: Publish an accepted application
+      description: Only ACCEPTED to PUBLISHED is allowed. Repeated publication returns 409.
+      responses:
+        '200':
+          $ref: '#/components/responses/ApplicationChanged'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /applications/{id}/rejection:
     parameters:
       - $ref: '#/components/parameters/ApplicationId'
     put:
       tags: [Applications]
       operationId: rejectApplication
-      summary: Set or replace the rejection reason
+      summary: Reject a verified or accepted application
       description: >-
-        A nonblank reason is mandatory. Repeating the same rejection leaves its
-        timestamp unchanged. Deleted applications cannot be rejected.
+        Allowed only in VERIFIED or ACCEPTED. A nonblank reason is mandatory.
+        Sets the state to REJECTED. Repeated rejection returns 409; its original
+        reason and timestamp cannot be replaced.
       requestBody:
         required: true
         content:
@@ -98,6 +162,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
 components:
   parameters:
     ApplicationId:
@@ -108,6 +174,12 @@ components:
         type: string
         format: uuid
   responses:
+    ApplicationChanged:
+      description: Application state changed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApplicationResponse'
     BadRequest:
       description: Missing or invalid input, including unexpected JSON properties
       content:
@@ -115,12 +187,23 @@ components:
           schema:
             $ref: '#/components/schemas/ApiProblem'
     NotFound:
-      description: Application does not exist, or is deleted (except repeated deletion)
+      description: Application does not exist, or is deleted when editing its body
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ApiProblem'
+    Conflict:
+      description: >-
+        Application has already been changed or the action is not allowed in its
+        current state. No data, reasons, or timestamps are modified.
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/ApiProblem'
   schemas:
+    ApplicationState:
+      type: string
+      enum: [CREATED, VERIFIED, ACCEPTED, PUBLISHED, DELETED, REJECTED]
     CreateApplicationRequest:
       type: object
       additionalProperties: false
@@ -160,7 +243,7 @@ components:
       enum: [DUPLICATE, CREATED_BY_MISTAKE, NO_LONGER_NEEDED]
     ApplicationResponse:
       type: object
-      required: [id, name, body, createdAt, updatedAt]
+      required: [id, name, body, state, createdAt, updatedAt]
       properties:
         id:
           type: string
@@ -172,6 +255,8 @@ components:
         createdAt:
           type: string
           format: date-time
+        state:
+          $ref: '#/components/schemas/ApplicationState'
         updatedAt:
           type: string
           format: date-time

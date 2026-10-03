@@ -1,14 +1,22 @@
 package com.societe.task.application;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -17,11 +25,13 @@ import org.springframework.boot.testcontainers.service.connection.ServiceConnect
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.ResultActions;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -60,6 +70,7 @@ class ApplicationApiTests {
 
         assertThat(application.get("name").asText()).isEqualTo("My application");
         assertThat(application.get("body").asText()).isEqualTo("Initial body");
+        assertThat(application.get("state").asText()).isEqualTo("CREATED");
         assertThat(application.get("rejectionReason").isNull()).isTrue();
         assertThat(application.get("rejectedAt").isNull()).isTrue();
         assertThat(OffsetDateTime.parse(application.get("createdAt").asText())).isNotNull();
@@ -67,45 +78,47 @@ class ApplicationApiTests {
                 .isEqualTo("My application");
     }
 
-    @Test
-    void editsOnlyBodyAndPreservesName() throws Exception {
-        var id = createApplication().get("id").asText();
+    @ParameterizedTest
+    @EnumSource(value = ApplicationState.class, names = {"CREATED", "VERIFIED"})
+    void editsOnlyBodyAndPreservesNameAndState(ApplicationState state) throws Exception {
+        var id = applicationInState(state);
 
         mockMvc.perform(patch("/applications/{id}", id)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"body\":\"Updated body\"}"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.id").value(id))
+                .andExpect(jsonPath("$.id").value(id.toString()))
                 .andExpect(jsonPath("$.name").value("My application"))
+                .andExpect(jsonPath("$.state").value(state.name()))
                 .andExpect(jsonPath("$.body").value("Updated body"));
 
         assertThat(jdbcTemplate.queryForObject("SELECT body FROM applications WHERE id = ?", String.class,
-                UUID.fromString(id))).isEqualTo("Updated body");
+                id)).isEqualTo("Updated body");
     }
 
     @Test
-    void rejectsWithReasonAndRepeatedPutIsIdempotent() throws Exception {
-        var id = createApplication().get("id").asText();
+    void rejectsWithReasonAndRepeatedPutReturnsConflictWithoutChangingData() throws Exception {
+        var id = applicationInState(ApplicationState.VERIFIED);
         var request = "{\"reason\":\"Missing documents\"}";
-
-        var first = mockMvc.perform(put("/applications/{id}/rejection", id)
-                        .contentType(MediaType.APPLICATION_JSON).content(request))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.rejectionReason").value("Missing documents"))
-                .andExpect(jsonPath("$.rejectedAt").isString())
-                .andReturn().getResponse().getContentAsString();
 
         mockMvc.perform(put("/applications/{id}/rejection", id)
                         .contentType(MediaType.APPLICATION_JSON).content(request))
                 .andExpect(status().isOk())
-                .andExpect(content().json(first));
+                .andExpect(jsonPath("$.state").value("REJECTED"))
+                .andExpect(jsonPath("$.rejectionReason").value("Missing documents"))
+                .andExpect(jsonPath("$.rejectedAt").isString());
 
-        assertThat(jdbcTemplate.queryForObject("SELECT rejection_reason FROM applications WHERE id = ?",
-                String.class, UUID.fromString(id))).isEqualTo("Missing documents");
+        var stored = storedApplication(id);
+
+        mockMvc.perform(put("/applications/{id}/rejection", id)
+                        .contentType(MediaType.APPLICATION_JSON).content(request))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.detail").value(containsString("already been changed")));
 
         mockMvc.perform(put("/applications/{id}/rejection", id)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"reason\":\"Not eligible\"}"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.rejectionReason").value("Not eligible"));
+                .andExpect(status().isConflict());
+
+        assertThat(storedApplication(id)).isEqualTo(stored);
     }
 
     @ParameterizedTest
@@ -119,11 +132,13 @@ class ApplicationApiTests {
         var stored = jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", UUID.fromString(id));
         assertThat(stored.get("deletion_reason")).isEqualTo(reason);
         assertThat(stored.get("deleted_at")).isNotNull();
+        assertThat(stored.get("state")).isEqualTo("DELETED");
         assertThat(stored.get("name")).isEqualTo("My application");
         assertThat(stored.get("body")).isEqualTo("Initial body");
 
         mockMvc.perform(delete("/applications/{id}", id).param("reason", "NO_LONGER_NEEDED"))
-                .andExpect(status().isNoContent());
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.detail").value(containsString("already been changed")));
 
         assertThat(jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", UUID.fromString(id)))
                 .isEqualTo(stored);
@@ -143,11 +158,83 @@ class ApplicationApiTests {
 
         mockMvc.perform(put("/applications/{id}/rejection", id)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"reason\":\"Missing documents\"}"))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isConflict());
 
         var stored = jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", UUID.fromString(id));
         assertThat(stored.get("body")).isEqualTo("Initial body");
         assertThat(stored.get("rejection_reason")).isNull();
+    }
+
+    @ParameterizedTest(name = "{0} -> {1}")
+    @MethodSource("transitionCases")
+    void enforcesEveryStateTransition(ApplicationState source, ApplicationState target, boolean allowed) throws Exception {
+        var id = applicationInState(source);
+        var before = storedApplication(id);
+        var response = performTransition(id, target);
+
+        if (allowed) {
+            response.andExpect(status().is(target == ApplicationState.DELETED ? 204 : 200));
+            if (target != ApplicationState.DELETED) {
+                response.andExpect(jsonPath("$.state").value(target.name()));
+            }
+            var after = storedApplication(id);
+            assertThat(after.get("state")).isEqualTo(target.name());
+            assertThat(after.get("name")).isEqualTo(before.get("name"));
+            assertThat(after.get("body")).isEqualTo(before.get("body"));
+            if (target == ApplicationState.REJECTED) {
+                assertThat(after.get("rejection_reason")).isEqualTo("Missing documents");
+                assertThat(after.get("rejected_at")).isNotNull();
+            }
+            if (target == ApplicationState.DELETED) {
+                assertThat(after.get("deletion_reason")).isEqualTo("DUPLICATE");
+                assertThat(after.get("deleted_at")).isNotNull();
+            }
+        } else {
+            response.andExpect(status().isConflict())
+                    .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                    .andExpect(jsonPath("$.status").value(409))
+                    .andExpect(jsonPath("$.detail").value(containsString("current state is " + source)));
+            assertThat(storedApplication(id)).isEqualTo(before);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ApplicationState.class, names = {"ACCEPTED", "PUBLISHED", "REJECTED", "DELETED"})
+    void cannotEditBodyInOtherStates(ApplicationState state) throws Exception {
+        var id = applicationInState(state);
+        var before = storedApplication(id);
+        mockMvc.perform(patch("/applications/{id}", id)
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"body\":\"Changed\"}"))
+                .andExpect(status().is(state == ApplicationState.DELETED ? 404 : 409));
+        assertThat(storedApplication(id)).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ApplicationState.class, names = {"VERIFIED", "DELETED"})
+    void concurrentRequestsCannotRepeatOrBypassTransitions(ApplicationState competingTarget) throws Exception {
+        var id = applicationInState(ApplicationState.CREATED);
+        var barrier = new CyclicBarrier(2);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var verification = executor.submit(() -> {
+                barrier.await(10, TimeUnit.SECONDS);
+                return performTransition(id, ApplicationState.VERIFIED).andReturn().getResponse().getStatus();
+            });
+            var competing = executor.submit(() -> {
+                barrier.await(10, TimeUnit.SECONDS);
+                return performTransition(id, competingTarget).andReturn().getResponse().getStatus();
+            });
+            var verificationStatus = verification.get(15, TimeUnit.SECONDS);
+            var competingStatus = competing.get(15, TimeUnit.SECONDS);
+            var expectedSuccess = competingTarget == ApplicationState.DELETED && competingStatus == 204 ? 204 : 200;
+            assertThat(List.of(verificationStatus, competingStatus)).containsExactlyInAnyOrder(expectedSuccess, 409);
+
+            var stored = storedApplication(id);
+            var expectedState = competingStatus == 204 ? "DELETED" : "VERIFIED";
+            assertThat(stored.get("state")).isEqualTo(expectedState);
+            assertThat(stored.get("name")).isEqualTo("My application");
+            assertThat(stored.get("body")).isEqualTo("Initial body");
+            assertThat(stored.get("deleted_at") != null).isEqualTo(expectedState.equals("DELETED"));
+        }
     }
 
     @ParameterizedTest
@@ -155,7 +242,8 @@ class ApplicationApiTests {
             "{}", "{\"name\":\"My application\"}", "{\"body\":\"Body\"}",
             "{\"name\":\"  \",\"body\":\"Body\"}", "{\"name\":\"Name\",\"body\":\"  \"}",
             "{\"name\":null,\"body\":\"Body\"}", "{\"name\":\"Name\",\"body\":null}",
-            "{\"name\":\"Name\",\"body\":\"Body\",\"unknown\":true}"
+            "{\"name\":\"Name\",\"body\":\"Body\",\"unknown\":true}",
+            "{\"name\":\"Name\",\"body\":\"Body\",\"state\":\"PUBLISHED\"}"
     })
     void rejectsInvalidCreateInput(String request) throws Exception {
         mockMvc.perform(post("/applications").contentType(MediaType.APPLICATION_JSON).content(request))
@@ -168,7 +256,8 @@ class ApplicationApiTests {
 
     @ParameterizedTest
     @ValueSource(strings = {"{}", "{\"body\":null}", "{\"body\":\"\"}", "{\"body\":\"  \"}",
-            "{\"body\":\"Updated body\",\"name\":\"Changed name\"}"})
+            "{\"body\":\"Updated body\",\"name\":\"Changed name\"}",
+            "{\"body\":\"Updated body\",\"state\":\"ACCEPTED\"}"})
     void rejectsInvalidEditOrAttemptToChangeName(String request) throws Exception {
         var id = createApplication().get("id").asText();
         mockMvc.perform(patch("/applications/{id}", id)
@@ -182,13 +271,13 @@ class ApplicationApiTests {
     @ParameterizedTest
     @ValueSource(strings = {"{}", "{\"reason\":null}", "{\"reason\":\"\"}", "{\"reason\":\"  \"}"})
     void rejectsMissingOrBlankRejectionReason(String request) throws Exception {
-        var id = createApplication().get("id").asText();
+        var id = applicationInState(ApplicationState.VERIFIED);
         mockMvc.perform(put("/applications/{id}/rejection", id)
                         .contentType(MediaType.APPLICATION_JSON).content(request))
                 .andExpect(status().isBadRequest());
 
         assertThat(jdbcTemplate.queryForObject("SELECT rejection_reason FROM applications WHERE id = ?",
-                String.class, UUID.fromString(id))).isNull();
+                String.class, id)).isNull();
     }
 
     @ParameterizedTest
@@ -221,6 +310,9 @@ class ApplicationApiTests {
                 .andExpect(status().isNotFound());
         mockMvc.perform(delete("/applications/{id}", id).param("reason", "DUPLICATE"))
                 .andExpect(status().isNotFound());
+        for (var action : List.of("verification", "acceptance", "publication")) {
+            mockMvc.perform(put("/applications/{id}/" + action, id)).andExpect(status().isNotFound());
+        }
     }
 
     @Test
@@ -244,5 +336,47 @@ class ApplicationApiTests {
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString();
         return objectMapper.readTree(response);
+    }
+
+    private UUID applicationInState(ApplicationState state) throws Exception {
+        var id = UUID.fromString(createApplication().get("id").asText());
+        if (state == ApplicationState.DELETED) {
+            performTransition(id, state).andExpect(status().isNoContent());
+            return id;
+        }
+        if (state != ApplicationState.CREATED) {
+            performTransition(id, ApplicationState.VERIFIED).andExpect(status().isOk());
+        }
+        if (state == ApplicationState.ACCEPTED || state == ApplicationState.PUBLISHED) {
+            performTransition(id, ApplicationState.ACCEPTED).andExpect(status().isOk());
+        }
+        if (state == ApplicationState.PUBLISHED || state == ApplicationState.REJECTED) {
+            performTransition(id, state).andExpect(status().isOk());
+        }
+        return id;
+    }
+
+    private ResultActions performTransition(UUID id, ApplicationState target) throws Exception {
+        return switch (target) {
+            case VERIFIED -> mockMvc.perform(put("/applications/{id}/verification", id));
+            case ACCEPTED -> mockMvc.perform(put("/applications/{id}/acceptance", id));
+            case PUBLISHED -> mockMvc.perform(put("/applications/{id}/publication", id));
+            case REJECTED -> mockMvc.perform(put("/applications/{id}/rejection", id)
+                    .contentType(MediaType.APPLICATION_JSON).content("{\"reason\":\"Missing documents\"}"));
+            case DELETED -> mockMvc.perform(delete("/applications/{id}", id).param("reason", "DUPLICATE"));
+            case CREATED -> throw new IllegalArgumentException("Creation is not a transition endpoint");
+        };
+    }
+
+    private Map<String, Object> storedApplication(UUID id) {
+        return jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", id);
+    }
+
+    private static Stream<Arguments> transitionCases() {
+        var allowed = List.of("CREATED:VERIFIED", "CREATED:DELETED", "VERIFIED:ACCEPTED",
+                "VERIFIED:REJECTED", "ACCEPTED:PUBLISHED", "ACCEPTED:REJECTED");
+        return Stream.of(ApplicationState.values()).flatMap(source ->
+                Stream.of(ApplicationState.values()).filter(target -> target != ApplicationState.CREATED)
+                        .map(target -> Arguments.of(source, target, allowed.contains(source + ":" + target))));
     }
 }

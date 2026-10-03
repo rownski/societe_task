@@ -1,6 +1,5 @@
 package com.societe.task.application;
 
-import java.util.Objects;
 import java.util.UUID;
 
 import org.springframework.http.HttpStatus;
@@ -23,29 +22,50 @@ public class ApplicationService {
     }
 
     public Application edit(UUID id, String body) {
-        requireActive(id);
+        var application = findForUpdate(id);
+        if (application.state() == ApplicationState.DELETED) {
+            throw notFound(id);
+        }
+        if (!application.state().canEditBody()) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Application body cannot be edited; its current state is " + application.state() + ".");
+        }
         return repository.updateBody(id, body);
     }
 
+    public Application verify(UUID id) {
+        return changeState(id, ApplicationState.VERIFIED);
+    }
+
+    public Application accept(UUID id) {
+        return changeState(id, ApplicationState.ACCEPTED);
+    }
+
+    public Application publish(UUID id) {
+        return changeState(id, ApplicationState.PUBLISHED);
+    }
+
     public Application reject(UUID id, String reason) {
-        var application = requireActive(id);
-        if (Objects.equals(application.rejectionReason(), reason)) {
-            return application;
-        }
-        return repository.reject(id, reason);
+        var application = requireTransition(id, ApplicationState.REJECTED);
+        return repository.reject(id, application.state(), reason);
     }
 
     public void delete(UUID id, String reason) {
-        var application = findForUpdate(id);
-        if (application.deletedAt() == null) {
-            repository.softDelete(id, reason);
-        }
+        requireTransition(id, ApplicationState.DELETED);
+        repository.softDelete(id, reason);
     }
 
-    private Application requireActive(UUID id) {
+    private Application changeState(UUID id, ApplicationState target) {
+        var application = requireTransition(id, target);
+        return repository.changeState(id, application.state(), target);
+    }
+
+    private Application requireTransition(UUID id, ApplicationState target) {
         var application = findForUpdate(id);
-        if (application.deletedAt() != null) {
-            throw notFound(id);
+        if (!application.state().canTransitionTo(target)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Application has already been changed or the transition is not allowed; its current state is "
+                            + application.state() + ". Requested state: " + target + ".");
         }
         return application;
     }

@@ -33,6 +33,21 @@ public class ApplicationController implements ApplicationsApi {
     }
 
     @Override
+    public ResponseEntity<ApplicationResponse> verifyApplication(UUID id) {
+        return ResponseEntity.ok(toResponse(service.verify(id)));
+    }
+
+    @Override
+    public ResponseEntity<ApplicationResponse> acceptApplication(UUID id) {
+        return ResponseEntity.ok(toResponse(service.accept(id)));
+    }
+
+    @Override
+    public ResponseEntity<ApplicationResponse> publishApplication(UUID id) {
+        return ResponseEntity.ok(toResponse(service.publish(id)));
+    }
+
+    @Override
     public ResponseEntity<ApplicationResponse> rejectApplication(UUID id, RejectApplicationRequest request) {
         return ResponseEntity.ok(toResponse(service.reject(id, request.getReason())));
     }
@@ -44,8 +59,13 @@ public class ApplicationController implements ApplicationsApi {
     }
 
     private ApplicationResponse toResponse(Application application) {
-        return new ApplicationResponse(application.id(), application.name(), application.body(),
-                application.createdAt(), application.updatedAt())
+        return new ApplicationResponse()
+                .id(application.id())
+                .name(application.name())
+                .body(application.body())
+                .state(com.societe.task.api.model.ApplicationState.fromValue(application.state().name()))
+                .createdAt(application.createdAt())
+                .updatedAt(application.updatedAt())
                 .rejectionReason(application.rejectionReason())
                 .rejectedAt(application.rejectedAt());
     }
