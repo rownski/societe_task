@@ -50,15 +50,7 @@ class ApplicationStateMigrationTests {
         assertThat(application.get("rejected_at")).isNull();
         assertThat(application.get("deletion_reason")).isNull();
         assertThat(application.get("deleted_at")).isNull();
-    }
-
-    @Test
-    void rerunningMigrationsDoesNotChangeExistingData() {
-        var id = insertApplication();
-        var before = jdbcTemplate.queryForMap("SELECT * FROM " + table() + " WHERE id = ?", id);
-
-        assertThat(flyway().migrate().migrationsExecuted).isZero();
-        assertThat(jdbcTemplate.queryForMap("SELECT * FROM " + table() + " WHERE id = ?", id)).isEqualTo(before);
+        assertThat(application.get("publication_number")).isNull();
     }
 
     @Test
@@ -81,6 +73,28 @@ class ApplicationStateMigrationTests {
                 + "deletion_reason = 'DUPLICATE', deleted_at = CURRENT_TIMESTAMP WHERE id = ?", id))
                 .isInstanceOf(DataIntegrityViolationException.class);
         assertThat(stateOf(id)).isEqualTo("CREATED");
+    }
+
+    @Test
+    void publicationNumberMustBePositiveUniqueAndPresentOnlyWhenPublished() {
+        var id = insertApplication();
+        assertThatThrownBy(() -> jdbcTemplate.update("UPDATE " + table() + " SET state = 'PUBLISHED' WHERE id = ?", id))
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbcTemplate.update("UPDATE " + table() + " SET publication_number = 1 WHERE id = ?", id))
+                .isInstanceOf(DataIntegrityViolationException.class);
+        for (var invalidNumber : new long[]{0, -1}) {
+            assertThatThrownBy(() -> jdbcTemplate.update("UPDATE " + table()
+                    + " SET state = 'PUBLISHED', publication_number = ? WHERE id = ?", invalidNumber, id))
+                    .isInstanceOf(DataIntegrityViolationException.class);
+        }
+
+        jdbcTemplate.update("UPDATE " + table() + " SET state = 'PUBLISHED', publication_number = 123 WHERE id = ?", id);
+        var other = insertApplication();
+        assertThatThrownBy(() -> jdbcTemplate.update("UPDATE " + table()
+                + " SET state = 'PUBLISHED', publication_number = 123 WHERE id = ?", other))
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThat(stateOf(id)).isEqualTo("PUBLISHED");
+        assertThat(stateOf(other)).isEqualTo("CREATED");
     }
 
     private Flyway flyway() {

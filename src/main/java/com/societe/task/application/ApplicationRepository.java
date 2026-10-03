@@ -18,6 +18,7 @@ public class ApplicationRepository {
             result.getString("name"),
             result.getString("body"),
             ApplicationState.valueOf(result.getString("state")),
+            result.getObject("publication_number", Long.class),
             result.getObject("created_at", OffsetDateTime.class),
             result.getObject("updated_at", OffsetDateTime.class),
             result.getString("rejection_reason"),
@@ -99,6 +100,16 @@ public class ApplicationRepository {
                 WHERE id = ? AND state = ?
                 RETURNING *
                 """, ROW_MAPPER, reason, id, current.name());
+    }
+
+    public Application publish(UUID id) {
+        return jdbcTemplate.queryForObject("""
+                UPDATE applications
+                SET state = 'PUBLISHED', publication_number = nextval('application_publication_number_seq'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state = 'ACCEPTED'
+                RETURNING *
+                """, ROW_MAPPER, id);
     }
 
     public void softDelete(UUID id, String reason) {

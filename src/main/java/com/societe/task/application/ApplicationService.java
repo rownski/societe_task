@@ -49,7 +49,8 @@ public class ApplicationService {
     }
 
     public Application publish(UUID id) {
-        return changeState(id, ApplicationState.PUBLISHED);
+        requireTransition(id, ApplicationState.PUBLISHED);
+        return repository.publish(id);
     }
 
     public Application reject(UUID id, String reason) {

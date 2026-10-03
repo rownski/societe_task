@@ -17,8 +17,8 @@ compiles these sources. Generated files are not committed or edited by hand.
 
 Applications use UUID identifiers. `name`, `body`, and rejection `reason` must be
 nonblank strings. Unknown JSON fields are rejected: clients cannot change the name,
-choose the initial state, or modify the state through a body edit. Create, edit,
-listing items, and successful PUT responses include the application's `state`.
+choose the initial state, set a publication number, or modify the state through a body
+edit. Create, edit, listing items, and successful PUT responses include the application's `state`.
 
 ## Application lifecycle
 
@@ -51,7 +51,7 @@ Body edits do not change the state, and the name is always immutable.
 | Edit body | `PATCH /applications/{id}` | `CREATED`, `VERIFIED` | JSON `body` | `200` with application |
 | Verify | `PUT /applications/{id}/verification` | `CREATED` | No body | `200` with application in `VERIFIED` |
 | Accept | `PUT /applications/{id}/acceptance` | `VERIFIED` | No body | `200` with application in `ACCEPTED` |
-| Publish | `PUT /applications/{id}/publication` | `ACCEPTED` | No body | `200` with application in `PUBLISHED` |
+| Publish | `PUT /applications/{id}/publication` | `ACCEPTED` | No body | `200` with application in `PUBLISHED` and its `publicationNumber` |
 | Reject | `PUT /applications/{id}/rejection` | `VERIFIED`, `ACCEPTED` | JSON `reason` | `200` with application in `REJECTED` |
 | Soft-delete | `DELETE /applications/{id}?reason=...` | `CREATED` | Enum query parameter | `204` |
 
@@ -60,6 +60,34 @@ Soft deletion retains the row and all its data, storing the reason and `deleted_
 Rejection stores `rejectionReason` and `rejectedAt`; these cannot be replaced after
 rejection. Mutations use transactional row locks so concurrent requests validate
 against the latest state and cannot bypass transition rules.
+
+### Publication numbers
+
+Successful `ACCEPTED → PUBLISHED` publication assigns a unique positive numeric
+`publicationNumber` (`int64`). Before publication this field is `null`; publication
+responses and listing items expose it after publication. The original UUID remains
+unchanged and is still used in endpoint URLs.
+
+For example, a published application's response includes:
+
+```json
+{
+  "id": "9c4b8206-1a2a-4e31-a7b1-58f790dabc02",
+  "state": "PUBLISHED",
+  "publicationNumber": 123
+}
+```
+
+The number and state are stored together in one transaction after validating the
+transition under a row lock. PostgreSQL's `application_publication_number_seq`
+starts at `1` and generates numbers safely across concurrent publications. Database
+constraints require numbers to be unique, positive, and present **only** in `PUBLISHED`.
+
+Numbers are not guaranteed to be consecutive: a transaction that rolls back can
+consume a sequence value without publishing an application. Gaps are acceptable.
+`PUBLISHED` remains terminal: the body and number cannot be changed, and rejection,
+deletion, or any further transition returns `409`. Repeated publication preserves
+the original number and does not allocate another sequence value.
 
 ### Errors and retries
 
@@ -149,6 +177,7 @@ curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/verification"
 curl --fail-with-body -sS -X PATCH "$BASE_URL/applications/$ID" \
   -H 'Content-Type: application/json' -d '{"body":"Edited while VERIFIED"}'
 curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/acceptance"
+# The publication response contains the server-assigned publicationNumber.
 curl --fail-with-body -sS -X PUT "$BASE_URL/applications/$ID/publication"
 
 # Repeating publication returns 409 Conflict, without changing data.
@@ -188,8 +217,9 @@ runs pending migrations from `src/main/resources/db/migration` in version order
 and records them in `flyway_schema_history`:
 
 - `V1__create_applications.sql`: creates the complete application table, including
-  the state column with a `CREATED` default, audit fields, and constraints enforcing
-  valid state values and matching rejection/deletion metadata.
+  the state column with a `CREATED` default, audit fields, publication number sequence,
+  and constraints enforcing valid states, matching rejection/deletion metadata, and
+  positive unique numbers present exactly in the `PUBLISHED` state.
 
 This is an unreleased POC: schema changes are currently consolidated into V1 instead
 of maintaining upgrades from earlier local versions. If an older V1 or V2 has already
@@ -272,15 +302,19 @@ With Docker running:
 Tests automatically start an isolated PostgreSQL container on a random port,
 configure the datasource using Spring Boot's `@ServiceConnection`, and remove
 the container afterward. Docker Compose does not need to be running. Tests
-check the HTTP health endpoint, database connectivity, and application endpoints
-(persistence, validation, immutable name, every allowed/forbidden transition,
-state-based edit restrictions, mandatory reasons, retry conflicts, and concurrent
-verification/deletion, plus listing pagination, name/state filters, deleted-row
-visibility, deterministic ordering, and query validation) using real PostgreSQL.
-Migration tests cover fresh V1 schema
-creation, the default state, metadata constraints, and reruns without data changes. State-policy
-unit tests also cover all 36 source/target state combinations, including attempts
-to return to `CREATED`.
+check the HTTP health endpoint and application endpoints using real PostgreSQL:
+persistence, validation, immutable name, all allowed transitions and representative
+forbidden transitions, state-based edit restrictions, mandatory reasons, retry
+conflicts, and concurrent verification/deletion. Publication tests additionally
+check number assignment, listing responses, terminality, transaction rollback, and
+concurrent publication of the same or different applications. Listing tests use
+direct database fixtures and cover pagination, name/state filters, deleted-row
+visibility, deterministic ordering, and query validation.
+
+Migration tests cover fresh V1 creation, the default state, metadata constraints,
+and publication-number constraints. Cheap state-policy unit tests exhaustively cover
+all 36 source/target combinations and body edit eligibility; API tests focus on
+HTTP/persistence behavior rather than repeating the entire policy matrix.
 Docker is required; database tests are not silently skipped when it is unavailable.
 
 ## Build

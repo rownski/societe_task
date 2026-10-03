@@ -6,7 +6,8 @@ info:
     Strict application lifecycle: CREATED to VERIFIED to ACCEPTED to PUBLISHED;
     CREATED to DELETED; VERIFIED or ACCEPTED to REJECTED. All other transitions,
     including repeated actions, return 409. Body edits are allowed only in CREATED
-    or VERIFIED. PUBLISHED, DELETED, and REJECTED are terminal states.
+    or VERIFIED. PUBLISHED, DELETED, and REJECTED are terminal states. Publication
+    assigns a unique positive publicationNumber; numbering may contain gaps.
 tags:
   - name: Applications
 paths:
@@ -170,7 +171,11 @@ paths:
       tags: [Applications]
       operationId: publishApplication
       summary: Publish an accepted application
-      description: Only ACCEPTED to PUBLISHED is allowed. Repeated publication returns 409.
+      description: >-
+        Only ACCEPTED to PUBLISHED is allowed. Atomically assigns a unique positive
+        publicationNumber from a database sequence and enters the terminal PUBLISHED
+        state. Numbers may contain gaps. UUIDs remain the identifiers used in URLs.
+        Repeated publication returns 409 without changing or allocating another number.
       responses:
         '200':
           $ref: '#/components/responses/ApplicationChanged'
@@ -328,6 +333,17 @@ components:
           format: date-time
         state:
           $ref: '#/components/schemas/ApplicationState'
+        publicationNumber:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          readOnly: true
+          description: >-
+            Unique numeric identifier assigned only on successful publication;
+            null in all other states. Cannot be provided or modified by clients.
+            Numbering may contain gaps.
+          example: 123
         updatedAt:
           type: string
           format: date-time

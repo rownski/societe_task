@@ -8,6 +8,7 @@ public record Application(
         String name,
         String body,
         ApplicationState state,
+        Long publicationNumber,
         OffsetDateTime createdAt,
         OffsetDateTime updatedAt,
         String rejectionReason,

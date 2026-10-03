@@ -1,6 +1,8 @@
 package com.societe.task.application;
 
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -27,11 +29,14 @@ import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -60,6 +65,12 @@ class ApplicationApiTests {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private ApplicationService applicationService;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
     @BeforeEach
     void cleanApplications() {
         jdbcTemplate.update("DELETE FROM applications");
@@ -73,6 +84,7 @@ class ApplicationApiTests {
         assertThat(application.get("name").asText()).isEqualTo("My application");
         assertThat(application.get("body").asText()).isEqualTo("Initial body");
         assertThat(application.get("state").asText()).isEqualTo("CREATED");
+        assertThat(application.get("publicationNumber").isNull()).isTrue();
         assertThat(application.get("rejectionReason").isNull()).isTrue();
         assertThat(application.get("rejectedAt").isNull()).isTrue();
         assertThat(OffsetDateTime.parse(application.get("createdAt").asText())).isNotNull();
@@ -125,7 +137,7 @@ class ApplicationApiTests {
 
     @ParameterizedTest
     @ValueSource(strings = {"DUPLICATE", "CREATED_BY_MISTAKE", "NO_LONGER_NEEDED"})
-    void softDeletesAndRetainsOriginalReasonOnRepeatedDelete(String reason) throws Exception {
+    void softDeletesWithEachSupportedReason(String reason) throws Exception {
         var id = createApplication().get("id").asText();
 
         mockMvc.perform(delete("/applications/{id}", id).param("reason", reason))
@@ -137,39 +149,23 @@ class ApplicationApiTests {
         assertThat(stored.get("state")).isEqualTo("DELETED");
         assertThat(stored.get("name")).isEqualTo("My application");
         assertThat(stored.get("body")).isEqualTo("Initial body");
-
-        mockMvc.perform(delete("/applications/{id}", id).param("reason", "NO_LONGER_NEEDED"))
-                .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.detail").value(containsString("already been changed")));
-
-        assertThat(jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", UUID.fromString(id)))
-                .isEqualTo(stored);
     }
 
     @Test
-    void cannotEditOrRejectSoftDeletedApplication() throws Exception {
-        var id = createApplication().get("id").asText();
-        mockMvc.perform(delete("/applications/{id}", id).param("reason", "DUPLICATE"))
-                .andExpect(status().isNoContent());
-
-        mockMvc.perform(patch("/applications/{id}", id)
-                        .contentType(MediaType.APPLICATION_JSON).content("{\"body\":\"Updated body\"}"))
-                .andExpect(status().isNotFound())
-                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
-                .andExpect(jsonPath("$.status").value(404));
-
-        mockMvc.perform(put("/applications/{id}/rejection", id)
-                        .contentType(MediaType.APPLICATION_JSON).content("{\"reason\":\"Missing documents\"}"))
-                .andExpect(status().isConflict());
-
-        var stored = jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", UUID.fromString(id));
-        assertThat(stored.get("body")).isEqualTo("Initial body");
-        assertThat(stored.get("rejection_reason")).isNull();
+    void repeatedDeletionPreservesOriginalReasonAndTimestamp() throws Exception {
+        var id = applicationInState(ApplicationState.DELETED);
+        var before = storedApplication(id);
+        for (var reason : List.of("DUPLICATE", "NO_LONGER_NEEDED")) {
+            mockMvc.perform(delete("/applications/{id}", id).param("reason", reason))
+                    .andExpect(status().isConflict())
+                    .andExpect(jsonPath("$.detail").value(containsString("already been changed")));
+            assertThat(storedApplication(id)).isEqualTo(before);
+        }
     }
 
     @ParameterizedTest(name = "{0} -> {1}")
     @MethodSource("transitionCases")
-    void enforcesEveryStateTransition(ApplicationState source, ApplicationState target, boolean allowed) throws Exception {
+    void enforcesRepresentativeTransitionsThroughApi(ApplicationState source, ApplicationState target, boolean allowed) throws Exception {
         var id = applicationInState(source);
         var before = storedApplication(id);
         var response = performTransition(id, target);
@@ -183,6 +179,11 @@ class ApplicationApiTests {
             assertThat(after.get("state")).isEqualTo(target.name());
             assertThat(after.get("name")).isEqualTo(before.get("name"));
             assertThat(after.get("body")).isEqualTo(before.get("body"));
+            if (target == ApplicationState.PUBLISHED) {
+                assertThat((Long) after.get("publication_number")).isPositive();
+            } else {
+                assertThat(after.get("publication_number")).isNull();
+            }
             if (target == ApplicationState.REJECTED) {
                 assertThat(after.get("rejection_reason")).isEqualTo("Missing documents");
                 assertThat(after.get("rejected_at")).isNotNull();
@@ -205,9 +206,12 @@ class ApplicationApiTests {
     void cannotEditBodyInOtherStates(ApplicationState state) throws Exception {
         var id = applicationInState(state);
         var before = storedApplication(id);
+        var expectedStatus = state == ApplicationState.DELETED ? 404 : 409;
         mockMvc.perform(patch("/applications/{id}", id)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"body\":\"Changed\"}"))
-                .andExpect(status().is(state == ApplicationState.DELETED ? 404 : 409));
+                .andExpect(status().is(expectedStatus))
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.status").value(expectedStatus));
         assertThat(storedApplication(id)).isEqualTo(before);
     }
 
@@ -239,13 +243,103 @@ class ApplicationApiTests {
         }
     }
 
+    @Test
+    void publicationAssignsNumberExposesItInListingAndKeepsTheApplicationFinal() throws Exception {
+        var id = applicationInState(ApplicationState.ACCEPTED);
+        assertThat(storedApplication(id).get("publication_number")).isNull();
+
+        var response = performTransition(id, ApplicationState.PUBLISHED)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(id.toString()))
+                .andExpect(jsonPath("$.state").value("PUBLISHED"))
+                .andExpect(jsonPath("$.publicationNumber").isNumber())
+                .andReturn().getResponse().getContentAsString();
+        var number = objectMapper.readTree(response).get("publicationNumber").longValue();
+        assertThat(number).isPositive();
+        var published = storedApplication(id);
+        assertThat(published).containsEntry("publication_number", number);
+
+        mockMvc.perform(get("/applications").param("state", "PUBLISHED"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content[0].id").value(id.toString()))
+                .andExpect(jsonPath("$.content[0].publicationNumber").value(number));
+
+        var sequenceBefore = publicationSequenceState();
+        for (var target : ApplicationState.values()) {
+            if (target != ApplicationState.CREATED) {
+                performTransition(id, target)
+                        .andExpect(status().isConflict())
+                        .andExpect(jsonPath("$.detail").value(containsString("current state is PUBLISHED")));
+            }
+        }
+        assertThat(storedApplication(id)).isEqualTo(published);
+        assertThat(publicationSequenceState()).isEqualTo(sequenceBefore);
+    }
+
+    @Test
+    void rollingBackPublicationKeepsStateAndNumberUnchanged() throws Exception {
+        var id = applicationInState(ApplicationState.ACCEPTED);
+        var before = storedApplication(id);
+        var rolledBackPublication = new TransactionTemplate(transactionManager).execute(transaction -> {
+            var published = applicationService.publish(id);
+            transaction.setRollbackOnly();
+            return published;
+        });
+
+        assertThat(rolledBackPublication.state()).isEqualTo(ApplicationState.PUBLISHED);
+        assertThat(rolledBackPublication.publicationNumber()).isPositive();
+        assertThat(storedApplication(id)).isEqualTo(before);
+
+        var response = performTransition(id, ApplicationState.PUBLISHED).andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        var number = objectMapper.readTree(response).get("publicationNumber").longValue();
+        // Sequence values are not rolled back; gaps are allowed, but partial publication is not.
+        assertThat(number).isGreaterThan(rolledBackPublication.publicationNumber());
+        assertThat(storedApplication(id)).containsEntry("publication_number", number).containsEntry("state", "PUBLISHED");
+    }
+
+    @ParameterizedTest(name = "same application: {0}")
+    @ValueSource(booleans = {true, false})
+    void concurrentPublicationsAllocateUniqueNumbersOnlyForSuccessfulRequests(boolean sameApplication) throws Exception {
+        var firstId = applicationInState(ApplicationState.ACCEPTED);
+        var secondId = sameApplication ? firstId : applicationInState(ApplicationState.ACCEPTED);
+        var barrier = new CyclicBarrier(2);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var first = executor.submit(() -> {
+                barrier.await(10, TimeUnit.SECONDS);
+                return performTransition(firstId, ApplicationState.PUBLISHED).andReturn().getResponse();
+            });
+            var second = executor.submit(() -> {
+                barrier.await(10, TimeUnit.SECONDS);
+                return performTransition(secondId, ApplicationState.PUBLISHED).andReturn().getResponse();
+            });
+            var responses = List.of(first.get(15, TimeUnit.SECONDS), second.get(15, TimeUnit.SECONDS));
+            assertThat(responses.stream().map(response -> response.getStatus()).toList())
+                    .containsExactlyInAnyOrder(200, sameApplication ? 409 : 200);
+            var numbers = new ArrayList<Long>();
+            for (var response : responses) {
+                if (response.getStatus() == 200) {
+                    var application = objectMapper.readTree(response.getContentAsString());
+                    var number = application.get("publicationNumber").longValue();
+                    assertThat(number).isPositive();
+                    numbers.add(number);
+                    var id = UUID.fromString(application.get("id").asText());
+                    assertThat(storedApplication(id)).containsEntry("state", "PUBLISHED")
+                            .containsEntry("publication_number", number);
+                }
+            }
+            assertThat(numbers).hasSize(sameApplication ? 1 : 2).doesNotHaveDuplicates();
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {
             "{}", "{\"name\":\"My application\"}", "{\"body\":\"Body\"}",
             "{\"name\":\"  \",\"body\":\"Body\"}", "{\"name\":\"Name\",\"body\":\"  \"}",
             "{\"name\":null,\"body\":\"Body\"}", "{\"name\":\"Name\",\"body\":null}",
             "{\"name\":\"Name\",\"body\":\"Body\",\"unknown\":true}",
-            "{\"name\":\"Name\",\"body\":\"Body\",\"state\":\"PUBLISHED\"}"
+            "{\"name\":\"Name\",\"body\":\"Body\",\"state\":\"PUBLISHED\"}",
+            "{\"name\":\"Name\",\"body\":\"Body\",\"publicationNumber\":123}"
     })
     void rejectsInvalidCreateInput(String request) throws Exception {
         mockMvc.perform(post("/applications").contentType(MediaType.APPLICATION_JSON).content(request))
@@ -259,7 +353,8 @@ class ApplicationApiTests {
     @ParameterizedTest
     @ValueSource(strings = {"{}", "{\"body\":null}", "{\"body\":\"\"}", "{\"body\":\"  \"}",
             "{\"body\":\"Updated body\",\"name\":\"Changed name\"}",
-            "{\"body\":\"Updated body\",\"state\":\"ACCEPTED\"}"})
+            "{\"body\":\"Updated body\",\"state\":\"ACCEPTED\"}",
+            "{\"body\":\"Updated body\",\"publicationNumber\":123}"})
     void rejectsInvalidEditOrAttemptToChangeName(String request) throws Exception {
         var id = createApplication().get("id").asText();
         mockMvc.perform(patch("/applications/{id}", id)
@@ -334,9 +429,9 @@ class ApplicationApiTests {
     @Test
     void listsWithDefaultPageSizeAndExcludesDeletedApplications() throws Exception {
         for (var index = 0; index < 12; index++) {
-            createApplication("Application " + index);
+            listingApplication("Application " + index, ApplicationState.CREATED);
         }
-        var deleted = applicationInState(ApplicationState.DELETED);
+        var deleted = listingApplication("Deleted application", ApplicationState.DELETED);
 
         var response = mockMvc.perform(get("/applications"))
                 .andExpect(status().isOk())
@@ -346,7 +441,7 @@ class ApplicationApiTests {
                 .andExpect(jsonPath("$.totalPages").value(2))
                 .andExpect(jsonPath("$.content.length()").value(10))
                 .andReturn().getResponse().getContentAsString();
-        assertThat(objectMapper.readTree(response).get("content").toString()).doesNotContain(deleted.toString());
+        assertThat(objectMapper.readTree(response).get("content").findValuesAsText("id")).doesNotContain(deleted.toString());
 
         mockMvc.perform(get("/applications").param("page", "1"))
                 .andExpect(status().isOk())
@@ -383,7 +478,7 @@ class ApplicationApiTests {
     void filtersByExactStateIncludingExplicitlyRequestedDeletedApplications(ApplicationState state) throws Exception {
         UUID expectedId = null;
         for (var fixtureState : ApplicationState.values()) {
-            var id = applicationInState(fixtureState);
+            var id = listingApplication("Application in " + fixtureState, fixtureState);
             if (fixtureState == state) {
                 expectedId = id;
             }
@@ -400,26 +495,24 @@ class ApplicationApiTests {
 
     @Test
     void filtersNamesByCaseInsensitiveSubstringWithoutIncludingDeletedApplications() throws Exception {
-        createApplication("Personal LOAN request");
-        createApplication("loan renewal");
-        createApplication("Mortgage");
-        var deleted = UUID.fromString(createApplication("Loan deleted").get("id").asText());
-        performTransition(deleted, ApplicationState.DELETED).andExpect(status().isNoContent());
+        var personal = listingApplication("Personal LOAN request", ApplicationState.CREATED);
+        var renewal = listingApplication("loan renewal", ApplicationState.CREATED);
+        listingApplication("Mortgage", ApplicationState.CREATED);
+        listingApplication("Loan deleted", ApplicationState.DELETED);
 
         mockMvc.perform(get("/applications").param("name", "LoAn"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(2))
+                .andExpect(jsonPath("$.content[*].id").value(containsInAnyOrder(personal.toString(), renewal.toString())))
                 .andExpect(jsonPath("$.totalElements").value(2))
                 .andExpect(jsonPath("$.totalPages").value(1));
     }
 
     @Test
     void combinesNameAndStateFiltersWithAnd() throws Exception {
-        var expected = UUID.fromString(createApplication("Personal LOAN request").get("id").asText());
-        performTransition(expected, ApplicationState.VERIFIED).andExpect(status().isOk());
-        createApplication("Loan created");
-        var mortgage = UUID.fromString(createApplication("Mortgage").get("id").asText());
-        performTransition(mortgage, ApplicationState.VERIFIED).andExpect(status().isOk());
+        var expected = listingApplication("Personal LOAN request", ApplicationState.VERIFIED);
+        listingApplication("Loan created", ApplicationState.CREATED);
+        listingApplication("Mortgage", ApplicationState.VERIFIED);
 
         mockMvc.perform(get("/applications").param("name", "loan").param("state", "VERIFIED"))
                 .andExpect(status().isOk())
@@ -431,11 +524,9 @@ class ApplicationApiTests {
 
     @Test
     void combinesNameFilterWithExplicitDeletedState() throws Exception {
-        var expected = UUID.fromString(createApplication("Loan duplicate").get("id").asText());
-        performTransition(expected, ApplicationState.DELETED).andExpect(status().isNoContent());
-        createApplication("Loan active");
-        var mortgage = UUID.fromString(createApplication("Mortgage duplicate").get("id").asText());
-        performTransition(mortgage, ApplicationState.DELETED).andExpect(status().isNoContent());
+        var expected = listingApplication("Loan duplicate", ApplicationState.DELETED);
+        listingApplication("Loan active", ApplicationState.CREATED);
+        listingApplication("Mortgage duplicate", ApplicationState.DELETED);
 
         mockMvc.perform(get("/applications").param("name", "loan").param("state", "DELETED"))
                 .andExpect(status().isOk())
@@ -447,21 +538,21 @@ class ApplicationApiTests {
     @ParameterizedTest
     @ValueSource(strings = {"%", "_", "\\", "' OR 1=1 --"})
     void treatsNameFilterAsLiteralTextAndNotSqlOrWildcards(String name) throws Exception {
-        var expected = createApplication("Prefix " + name + " suffix").get("id").asText();
-        createApplication("Other application");
+        var expected = listingApplication("Prefix " + name + " suffix", ApplicationState.CREATED);
+        listingApplication("Other application", ApplicationState.CREATED);
 
         mockMvc.perform(get("/applications").param("name", name))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(1))
-                .andExpect(jsonPath("$.content[0].id").value(expected))
+                .andExpect(jsonPath("$.content[0].id").value(expected.toString()))
                 .andExpect(jsonPath("$.totalElements").value(1));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"", "  ", "\t"})
     void blankNameFilterImposesNoRestriction(String name) throws Exception {
-        createApplication();
-        applicationInState(ApplicationState.DELETED);
+        listingApplication("Active", ApplicationState.CREATED);
+        listingApplication("Deleted", ApplicationState.DELETED);
         mockMvc.perform(get("/applications").param("name", name))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content.length()").value(1))
@@ -481,7 +572,7 @@ class ApplicationApiTests {
 
     @Test
     void returnsEmptyPageWhenFiltersHaveNoMatches() throws Exception {
-        createApplication();
+        listingApplication("My application", ApplicationState.CREATED);
         mockMvc.perform(get("/applications").param("name", "Unmatched"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content").isEmpty())
@@ -491,7 +582,7 @@ class ApplicationApiTests {
 
     @Test
     void returnsEmptyOutOfRangePageWithoutOverflowingOffset() throws Exception {
-        createApplication();
+        listingApplication("My application", ApplicationState.CREATED);
         mockMvc.perform(get("/applications").param("page", "2147483647").param("size", "100"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content").isEmpty())
@@ -512,10 +603,26 @@ class ApplicationApiTests {
     }
 
     private void insertListingFixture(UUID id, OffsetDateTime createdAt) {
+        insertListingFixture(id, "Listing fixture", ApplicationState.CREATED, createdAt);
+    }
+
+    private UUID listingApplication(String name, ApplicationState state) {
+        var id = UUID.randomUUID();
+        insertListingFixture(id, name, state, OffsetDateTime.now(ZoneOffset.UTC));
+        return id;
+    }
+
+    private void insertListingFixture(UUID id, String name, ApplicationState state, OffsetDateTime createdAt) {
         jdbcTemplate.update("""
-                INSERT INTO applications (id, name, body, created_at, updated_at)
-                VALUES (?, 'Listing fixture', 'Initial body', ?, ?)
-                """, id, createdAt, createdAt);
+                INSERT INTO applications (id, name, body, state, created_at, updated_at,
+                    rejection_reason, rejected_at, deletion_reason, deleted_at, publication_number)
+                VALUES (?, ?, 'Initial body', ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? = 'PUBLISHED' THEN nextval('application_publication_number_seq') ELSE NULL END)
+                """, id, name, state.name(), createdAt, createdAt,
+                state == ApplicationState.REJECTED ? "Missing documents" : null,
+                state == ApplicationState.REJECTED ? createdAt : null,
+                state == ApplicationState.DELETED ? "DUPLICATE" : null,
+                state == ApplicationState.DELETED ? createdAt : null, state.name());
     }
 
     private JsonNode createApplication() throws Exception {
@@ -565,11 +672,29 @@ class ApplicationApiTests {
         return jdbcTemplate.queryForMap("SELECT * FROM applications WHERE id = ?", id);
     }
 
+    private Map<String, Object> publicationSequenceState() {
+        return jdbcTemplate.queryForMap("SELECT last_value, is_called FROM application_publication_number_seq");
+    }
+
     private static Stream<Arguments> transitionCases() {
-        var allowed = List.of("CREATED:VERIFIED", "CREATED:DELETED", "VERIFIED:ACCEPTED",
-                "VERIFIED:REJECTED", "ACCEPTED:PUBLISHED", "ACCEPTED:REJECTED");
-        return Stream.of(ApplicationState.values()).flatMap(source ->
-                Stream.of(ApplicationState.values()).filter(target -> target != ApplicationState.CREATED)
-                        .map(target -> Arguments.of(source, target, allowed.contains(source + ":" + target))));
+        // Exhaustive policy coverage belongs to ApplicationStateTests. Here we verify
+        // every successful endpoint path, shared retry handling, and representative errors.
+        // Dedicated tests cover publication terminality and rejection/deletion retries.
+        return Stream.of(
+                Arguments.of(ApplicationState.CREATED, ApplicationState.VERIFIED, true),
+                Arguments.of(ApplicationState.CREATED, ApplicationState.DELETED, true),
+                Arguments.of(ApplicationState.VERIFIED, ApplicationState.ACCEPTED, true),
+                Arguments.of(ApplicationState.VERIFIED, ApplicationState.REJECTED, true),
+                Arguments.of(ApplicationState.ACCEPTED, ApplicationState.PUBLISHED, true),
+                Arguments.of(ApplicationState.ACCEPTED, ApplicationState.REJECTED, true),
+                Arguments.of(ApplicationState.VERIFIED, ApplicationState.VERIFIED, false),
+                Arguments.of(ApplicationState.ACCEPTED, ApplicationState.ACCEPTED, false),
+                Arguments.of(ApplicationState.CREATED, ApplicationState.ACCEPTED, false),
+                Arguments.of(ApplicationState.CREATED, ApplicationState.PUBLISHED, false),
+                Arguments.of(ApplicationState.CREATED, ApplicationState.REJECTED, false),
+                Arguments.of(ApplicationState.VERIFIED, ApplicationState.DELETED, false),
+                Arguments.of(ApplicationState.ACCEPTED, ApplicationState.DELETED, false),
+                Arguments.of(ApplicationState.DELETED, ApplicationState.REJECTED, false),
+                Arguments.of(ApplicationState.REJECTED, ApplicationState.VERIFIED, false));
     }
 }

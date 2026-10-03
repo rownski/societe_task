@@ -77,6 +77,7 @@ public class ApplicationController implements ApplicationsApi {
                 .name(application.name())
                 .body(application.body())
                 .state(com.societe.task.api.model.ApplicationState.fromValue(application.state().name()))
+                .publicationNumber(application.publicationNumber())
                 .createdAt(application.createdAt())
                 .updatedAt(application.updatedAt())
                 .rejectionReason(application.rejectionReason())
